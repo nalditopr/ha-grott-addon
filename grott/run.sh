@@ -107,9 +107,10 @@ src = p.read_text()
 needle = "validatecc = validate_record(vdata)"
 if "HEX [" not in src:
     inject = (
-        "        try: peer = self.s.getpeername()\n"
+        "try: peer = self.s.getpeername()\n"
         "        except Exception: peer = ('?', '?')\n"
-        "        print('\\t - HEX [' + str(peer) + '] (' + str(len(vdata)//2) + ' bytes): ' + vdata)\n        "
+        "        print('\\t - HEX [' + str(peer) + '] (' + str(len(vdata)//2) + ' bytes): ' + vdata)\n"
+        "        "
     )
     src = src.replace(needle, inject + needle)
 src = src.replace(
