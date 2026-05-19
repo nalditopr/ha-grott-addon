@@ -144,7 +144,9 @@ def build_reply(data: bytes, cid: int) -> bytes:
             if key in parsed:
                 ack[key] = parsed[key]
     ack_body = json.dumps(ack, separators=(",", ":")).encode("utf-8")
-    return _frame(msg_type, ack_body)
+    # Response type clears the direction bit (0x2000 → 0x0000)
+    reply_type = msg_type & 0x0FFF
+    return _frame(reply_type, ack_body)
 
 
 def ensure_cert() -> None:
