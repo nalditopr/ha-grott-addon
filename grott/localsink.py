@@ -19,12 +19,15 @@ restarts/upgrades.
 """
 
 import datetime
+import json
 import os
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import threading
+import time
 
 
 CERT_PATH = "/data/sink_cert.pem"
@@ -44,6 +47,44 @@ def _ts() -> str:
 
 def _log(cid: int, msg: str) -> None:
     print(f"[{_ts()}] [conn#{cid}] {msg}", flush=True)
+
+
+def _frame(msg_type: int, payload: bytes) -> bytes:
+    """Wrap payload in the dongle's framing: 2B type (BE) + 4B length (BE) + payload."""
+    return struct.pack(">HI", msg_type, len(payload)) + payload
+
+
+def build_reply(data: bytes, cid: int) -> bytes:
+    """Guess an appropriate framed JSON ack based on the request.
+
+    The protocol so far: ``[type:2B][len:4B][JSON]``. For the type=0x2002
+    'registration' frame the dongle includes ``id``/``rand``/``sign``/``uptime``.
+    We attempt a generic success reply mirroring its framing so the dongle
+    advances to whatever comes next.
+    """
+    if len(data) < 6:
+        _log(cid, "payload too short to parse — skipping reply")
+        return b""
+
+    msg_type, msg_len = struct.unpack(">HI", data[:6])
+    body = data[6:6 + msg_len]
+    _log(cid, f"parsed type=0x{msg_type:04x} length={msg_len} body_bytes={len(body)}")
+
+    parsed = None
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+        _log(cid, f"parsed JSON: {parsed!r}")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        _log(cid, "body is not UTF-8 JSON — treating as opaque")
+
+    ack = {"result": 0, "time": int(time.time())}
+    if isinstance(parsed, dict):
+        if "id" in parsed:
+            ack["id"] = parsed["id"]
+        if "rand" in parsed:
+            ack["rand"] = parsed["rand"]
+    ack_body = json.dumps(ack, separators=(",", ":")).encode("utf-8")
+    return _frame(msg_type, ack_body)
 
 
 def ensure_cert() -> None:
@@ -108,19 +149,13 @@ def handle_capture(conn: socket.socket, addr, cid: int, ssl_ctx: ssl.SSLContext)
                         _log(cid, "TLS EOF")
                         break
                     _log(cid, f"TLS RX {len(data)}B: {hexdump(data)}")
-                    # Reply with a stock-looking HTTP 200 + simple ack body, in case it's HTTP.
-                    # If it's something else, dongle will close — but we've already captured the request.
-                    reply = (
-                        b"HTTP/1.1 200 OK\r\n"
-                        b"Content-Type: application/octet-stream\r\n"
-                        b"Content-Length: 2\r\n"
-                        b"Connection: close\r\n"
-                        b"\r\n"
-                        b"OK"
-                    )
+                    reply = build_reply(data, cid)
+                    if not reply:
+                        _log(cid, "no reply built — keep reading")
+                        continue
                     try:
                         tls.sendall(reply)
-                        _log(cid, f"TLS TX {len(reply)}B (HTTP 200 OK ack)")
+                        _log(cid, f"TLS TX {len(reply)}B: {hexdump(reply)}")
                     except OSError as e:
                         _log(cid, f"TLS TX failed: {e}")
                         break
