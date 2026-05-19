@@ -1,18 +1,10 @@
-"""Local TCP responder for the grott add-on.
+"""Local TCP responder / TLS MITM / MQTT publisher for the grott add-on.
 
 Modes, set by env var GROTT_SINK_MODE:
 
 - ``discard``: accept connections, read & discard, never reply.
-  Used when ``forward_to_cloud=false`` and we just need grott's proxy
-  forward to succeed so decode + MQTT publish run normally.
-
-- ``capture``: log every byte received (hex + ASCII), with timestamps
-  and per-connection IDs. For each connection, peek the first byte:
-    * 0x16 → TLS ClientHello. Terminate TLS with a self-signed cert
-      (auto-generated in /data) and log the decrypted plaintext from
-      the dongle. This lets us see the application protocol inside.
-    * anything else → assume plaintext probe (e.g. ``hello``). Echo
-      back so the dongle gets an ACK.
+- ``capture``: log every byte, terminate TLS, parse framed JSON, and
+  publish decoded payloads to MQTT.
 
 Cert is generated on first run via openssl and persisted across
 restarts/upgrades.
@@ -29,16 +21,40 @@ import sys
 import threading
 import time
 
+# MQTT is optional — only used when env vars are provided
+try:
+    import paho.mqtt.client as mqtt
+except Exception:
+    mqtt = None
+
+
+def _make_mqtt_client():
+    """Create an MQTT client compatible with paho-mqtt v1 and v2."""
+    if mqtt is None:
+        return None
+    try:
+        # paho-mqtt v2 requires CallbackAPIVersion
+        import paho.mqtt.enums as mqtt_enums
+        return mqtt.Client(mqtt_enums.CallbackAPIVersion.VERSION1)
+    except Exception:
+        # paho-mqtt v1
+        return mqtt.Client()
+
 
 CERT_PATH = "/data/sink_cert.pem"
 KEY_PATH = "/data/sink_key.pem"
 CERT_CN = os.environ.get("GROTT_SINK_CN", "gw-solar-dc.vidagrid.com")
 
+# MQTT config from environment (injected by run.sh)
+MQTT_HOST = os.environ.get("GROTT_MQTT_HOST", "")
+MQTT_PORT = int(os.environ.get("GROTT_MQTT_PORT", "1883"))
+MQTT_TOPIC = os.environ.get("GROTT_MQTT_TOPIC", "energy/growatt")
+MQTT_USER = os.environ.get("GROTT_MQTT_USER", "")
+MQTT_PSW = os.environ.get("GROTT_MQTT_PSW", "")
+MQTT_RETAIN = os.environ.get("GROTT_MQTT_RETAIN", "false").lower() == "true"
 
-def hexdump(data: bytes) -> str:
-    hexed = data.hex()
-    ascii_repr = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
-    return f"{hexed}   |{ascii_repr}|"
+_mqtt_client = None
+_mqtt_lock = threading.Lock()
 
 
 def _ts() -> str:
@@ -49,19 +65,58 @@ def _log(cid: int, msg: str) -> None:
     print(f"[{_ts()}] [conn#{cid}] {msg}", flush=True)
 
 
+def hexdump(data: bytes) -> str:
+    hexed = data.hex()
+    ascii_repr = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
+    return f"{hexed}   |{ascii_repr}|"
+
+
 def _frame(msg_type: int, payload: bytes) -> bytes:
     """Wrap payload in the dongle's framing: 2B type (BE) + 4B length (BE) + payload."""
     return struct.pack(">HI", msg_type, len(payload)) + payload
 
 
-def build_reply(data: bytes, cid: int) -> bytes:
-    """Guess an appropriate framed JSON ack based on the request.
+def get_mqtt_client():
+    global _mqtt_client
+    if mqtt is None:
+        return None
+    if _mqtt_client is not None:
+        return _mqtt_client
+    with _mqtt_lock:
+        if _mqtt_client is not None:
+            return _mqtt_client
+        if not MQTT_HOST:
+            return None
+        client = _make_mqtt_client()
+        if client is None:
+            return None
+        if MQTT_USER:
+            client.username_pw_set(MQTT_USER, MQTT_PSW)
+        try:
+            client.connect(MQTT_HOST, MQTT_PORT, 60)
+            client.loop_start()
+            _mqtt_client = client
+            print(f"[localsink] MQTT connected to {MQTT_HOST}:{MQTT_PORT} topic={MQTT_TOPIC}", flush=True)
+        except Exception as e:
+            print(f"[localsink] MQTT connect failed: {e}", flush=True)
+            return None
+    return _mqtt_client
 
-    The protocol so far: ``[type:2B][len:4B][JSON]``. For the type=0x2002
-    'registration' frame the dongle includes ``id``/``rand``/``sign``/``uptime``.
-    We attempt a generic success reply mirroring its framing so the dongle
-    advances to whatever comes next.
-    """
+
+def mqtt_publish(subtopic: str, payload: dict, cid: int = 0) -> None:
+    client = get_mqtt_client()
+    if client is None:
+        return
+    topic = f"{MQTT_TOPIC}/{subtopic}" if subtopic else MQTT_TOPIC
+    try:
+        client.publish(topic, json.dumps(payload), retain=MQTT_RETAIN)
+        _log(cid, f"MQTT → {topic}")
+    except Exception as e:
+        _log(cid, f"MQTT publish failed: {e}")
+
+
+def build_reply(data: bytes, cid: int) -> bytes:
+    """Guess an appropriate framed JSON ack based on the request."""
     if len(data) < 6:
         _log(cid, "payload too short to parse — skipping reply")
         return b""
@@ -76,6 +131,10 @@ def build_reply(data: bytes, cid: int) -> bytes:
         _log(cid, f"parsed JSON: {parsed!r}")
     except (UnicodeDecodeError, json.JSONDecodeError):
         _log(cid, "body is not UTF-8 JSON — treating as opaque")
+
+    # Publish raw received frame to MQTT for observation / debugging
+    if isinstance(parsed, dict):
+        mqtt_publish("raw", {"type": msg_type, "data": parsed}, cid)
 
     ack = {"result": 0, "time": int(time.time())}
     if isinstance(parsed, dict):
@@ -105,7 +164,6 @@ def ensure_cert() -> None:
 def make_ssl_context() -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(CERT_PATH, KEY_PATH)
-    # Maximize chances of completing the handshake with quirky clients.
     try:
         ctx.set_ciphers("ALL:@SECLEVEL=0")
     except ssl.SSLError:
@@ -144,7 +202,11 @@ def handle_capture(conn: socket.socket, addr, cid: int, ssl_ctx: ssl.SSLContext)
 
             try:
                 while True:
-                    data = tls.recv(8192)
+                    try:
+                        data = tls.recv(8192)
+                    except OSError as e:
+                        _log(cid, f"TLS recv error: {e}")
+                        break
                     if not data:
                         _log(cid, "TLS EOF")
                         break
@@ -167,7 +229,10 @@ def handle_capture(conn: socket.socket, addr, cid: int, ssl_ctx: ssl.SSLContext)
         else:
             _log(cid, f"first byte 0x{head.hex()} → plaintext, echo mode")
             while True:
-                data = conn.recv(4096)
+                try:
+                    data = conn.recv(4096)
+                except OSError:
+                    break
                 if not data:
                     break
                 _log(cid, f"RX {len(data)}B: {hexdump(data)}")
@@ -202,6 +267,7 @@ def handle_discard(conn: socket.socket, addr, cid: int, ssl_ctx) -> None:
 
 def main() -> None:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5280
+    bind_addr = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
     mode = os.environ.get("GROTT_SINK_MODE", "discard").strip().lower()
     handler = handle_capture if mode == "capture" else handle_discard
     ssl_ctx = None
@@ -211,9 +277,9 @@ def main() -> None:
 
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", port))
+    srv.bind((bind_addr, port))
     srv.listen(64)
-    print(f"localsink mode={mode} listening on 127.0.0.1:{port}", flush=True)
+    print(f"localsink mode={mode} listening on {bind_addr}:{port}", flush=True)
 
     cid = 0
     while True:
