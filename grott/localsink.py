@@ -186,6 +186,26 @@ def extract_metadata(data: bytes) -> dict:
     return meta
 
 
+def log_frame(data: bytes, meta: dict, cid: int) -> None:
+    """Persist frame hex + metadata to /data for offline analysis."""
+    import pathlib, glob
+    frame_dir = pathlib.Path("/data/frames")
+    frame_dir.mkdir(exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = frame_dir / f"{ts}_conn{cid}"
+    try:
+        (base.with_suffix(".hex")).write_text(data.hex())
+        (base.with_suffix(".json")).write_text(json.dumps(meta, indent=2, default=str))
+    except OSError as e:
+        _log(cid, f"frame log failed: {e}")
+        return
+    # Keep only the newest 200 frames
+    files = sorted(frame_dir.glob("*.hex"), key=lambda p: p.stat().st_mtime)
+    for old in files[:-200]:
+        old.unlink(missing_ok=True)
+        old.with_suffix(".json").unlink(missing_ok=True)
+
+
 def build_reply(data: bytes, cid: int) -> bytes:
     """Guess an appropriate framed JSON ack based on the request."""
     if len(data) < 6:
@@ -227,6 +247,8 @@ def build_reply(data: bytes, cid: int) -> bytes:
             _log(cid, f"metadata: {meta!r}")
         # Also publish raw hex for external decoders
         mqtt_publish("raw_hex", {"type": "0x260f", "hex": data.hex()}, cid)
+        # Persist to disk for time-series comparison / RE
+        log_frame(data, meta or {}, cid)
     else:
         # Generic fallback for unknown message types
         ack = {"result": 1, "time": int(time.time())}
