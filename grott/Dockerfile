@@ -18,6 +18,7 @@ RUN apk add --no-cache \
     && rm -rf "${GROTT_DIR}/.git"
 
 COPY run.sh /run.sh
+COPY localsink.py /opt/localsink.py
 RUN chmod a+x /run.sh
 
 LABEL \

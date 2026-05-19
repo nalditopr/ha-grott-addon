@@ -90,10 +90,11 @@ if [ -n "${EXTRA_INI}" ]; then
 fi
 
 if ! bashio::var.true "${FORWARD_TO_CLOUD}"; then
-    bashio::log.info "Cloud forwarding disabled — rewriting [Growatt] to local sink (127.0.0.1:1)"
-    # grott forwards regardless; pointing at a closed port prevents talking to Growatt cloud.
+    SINK_PORT=5280
+    bashio::log.info "Cloud forwarding disabled — starting local TCP sink on 127.0.0.1:${SINK_PORT}"
+    python3 -u /opt/localsink.py "${SINK_PORT}" &
     sed -i "s|^growattip = .*|growattip = 127.0.0.1|" "${CONF}"
-    sed -i "s|^growattport = .*|growattport = 1|" "${CONF}"
+    sed -i "s|^growattport = .*|growattport = ${SINK_PORT}|" "${CONF}"
 fi
 
 bashio::log.info "Starting grott — listening on 0.0.0.0:${LISTEN_PORT}, HTTP API on :${HTTP_PORT}"
