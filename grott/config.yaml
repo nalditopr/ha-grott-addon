@@ -1,5 +1,5 @@
 name: Grott
-version: "0.2.1"
+version: "0.3.0"
 slug: grott
 description: Local proxy + MQTT bridge for Growatt solar inverters
 url: https://github.com/nalditopr/ha-grott-addon/tree/main/grott
@@ -30,6 +30,7 @@ options:
   mqtt_topic: energy/growatt
   mqtt_retain: false
   verbose: true
+  debug_hex: false
   mqtt_host: ""
   mqtt_port: 1883
   mqtt_user: ""
@@ -44,6 +45,7 @@ schema:
   mqtt_topic: str
   mqtt_retain: bool
   verbose: bool
+  debug_hex: bool
   mqtt_host: str?
   mqtt_port: port?
   mqtt_user: str?

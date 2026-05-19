@@ -11,6 +11,7 @@ HTTP_PORT="$(bashio::config 'http_api_port')"
 MQTT_TOPIC="$(bashio::config 'mqtt_topic')"
 MQTT_RETAIN="$(bashio::config 'mqtt_retain')"
 VERBOSE="$(bashio::config 'verbose')"
+DEBUG_HEX="$(bashio::config 'debug_hex')"
 EXTRA_INI="$(bashio::config 'extra_ini')"
 
 MANUAL_HOST="$(bashio::config 'mqtt_host')"
@@ -95,6 +96,29 @@ if ! bashio::var.true "${FORWARD_TO_CLOUD}"; then
     python3 -u /opt/localsink.py "${SINK_PORT}" &
     sed -i "/^\[Growatt\]/,/^\[/ s|^ip = .*|ip = 127.0.0.1|" "${CONF}"
     sed -i "/^\[Growatt\]/,/^\[/ s|^port = .*|port = ${SINK_PORT}|" "${CONF}"
+fi
+
+if bashio::var.true "${DEBUG_HEX}"; then
+    bashio::log.warning "DEBUG_HEX enabled — patching grottproxy.py for protocol capture"
+    python3 - <<'PY'
+import pathlib, re
+p = pathlib.Path("/opt/grott/grottproxy.py")
+src = p.read_text()
+needle = "validatecc = validate_record(vdata)"
+if "HEX [" not in src:
+    inject = (
+        "        try: peer = self.s.getpeername()\n"
+        "        except Exception: peer = ('?', '?')\n"
+        "        print('\\t - HEX [' + str(peer) + '] (' + str(len(vdata)//2) + ' bytes): ' + vdata)\n        "
+    )
+    src = src.replace(needle, inject + needle)
+src = src.replace(
+    "print(f\"\\t - Grott - grottproxy - Invalid data record received, processing stopped for this record\")\n            #Create response if needed? \n            #self.send_queuereg[qname].put(response)\n            return",
+    "print(f\"\\t - Grott - INVALID record kept (debug_hex=true)\")\n            pass  # do not return — keep forwarding for capture",
+)
+p.write_text(src)
+print("grottproxy.py patched for debug_hex")
+PY
 fi
 
 bashio::log.info "Starting grott — listening on 0.0.0.0:${LISTEN_PORT}, HTTP API on :${HTTP_PORT}"
