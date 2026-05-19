@@ -136,12 +136,17 @@ def build_reply(data: bytes, cid: int) -> bytes:
     if isinstance(parsed, dict):
         mqtt_publish("raw", {"type": msg_type, "data": parsed}, cid)
 
-    # Real server replies observed:
-    #   0x2002 registration → 0x2102 {"code":0}  (success)
-    #   0x2002 registration → 0x2a02 {"action":"quit","reason":"..."} (failure)
+    # Real server replies observed by forwarding to gw-solar-dc.vidagrid.com:22015:
+    #   0x2002 registration → 0x2102 {"code":0}
+    #   0x260f data upload  → 0x2302 [<ts_us>, <next_ts_us>]
+    #   0x2002 bad sign     → 0x2a02 {"action":"quit","reason":"..."}
     if msg_type == 0x2002:
         ack_body = b'{"code":0}'
         reply_type = 0x2102
+    elif msg_type == 0x260f:
+        now_us = int(time.time() * 1_000_000)
+        ack_body = json.dumps([now_us, now_us + 60_000_000], separators=(",", ":")).encode("utf-8")
+        reply_type = 0x2302
     else:
         # Generic fallback for unknown message types
         ack = {"result": 1, "time": int(time.time())}
