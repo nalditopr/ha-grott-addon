@@ -136,15 +136,21 @@ def build_reply(data: bytes, cid: int) -> bytes:
     if isinstance(parsed, dict):
         mqtt_publish("raw", {"type": msg_type, "data": parsed}, cid)
 
-    ack = {"result": 1, "time": int(time.time())}
-    if isinstance(parsed, dict):
-        # Only echo id/rand — server reply should not include client sign/uptime
-        for key in ["id", "rand"]:
-            if key in parsed:
-                ack[key] = parsed[key]
-    ack_body = json.dumps(ack, separators=(",", ":")).encode("utf-8")
-    # Response type clears the direction bit (0x2000 → 0x0000)
-    reply_type = msg_type & 0x0FFF
+    # Real server replies observed:
+    #   0x2002 registration → 0x2102 {"code":0}  (success)
+    #   0x2002 registration → 0x2a02 {"action":"quit","reason":"..."} (failure)
+    if msg_type == 0x2002:
+        ack_body = b'{"code":0}'
+        reply_type = 0x2102
+    else:
+        # Generic fallback for unknown message types
+        ack = {"result": 1, "time": int(time.time())}
+        if isinstance(parsed, dict):
+            for key in ["id", "rand"]:
+                if key in parsed:
+                    ack[key] = parsed[key]
+        ack_body = json.dumps(ack, separators=(",", ":")).encode("utf-8")
+        reply_type = msg_type & 0x0FFF
     return _frame(reply_type, ack_body)
 
 
