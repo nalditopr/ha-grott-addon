@@ -138,9 +138,8 @@ def build_reply(data: bytes, cid: int) -> bytes:
 
     ack = {"result": 1, "time": int(time.time())}
     if isinstance(parsed, dict):
-        # Echo back all fields the dongle sent — some devices expect
-        # sign/uptime/others to be mirrored in the ack.
-        for key in ["id", "rand", "sign", "uptime"]:
+        # Only echo id/rand — server reply should not include client sign/uptime
+        for key in ["id", "rand"]:
             if key in parsed:
                 ack[key] = parsed[key]
     ack_body = json.dumps(ack, separators=(",", ":")).encode("utf-8")
