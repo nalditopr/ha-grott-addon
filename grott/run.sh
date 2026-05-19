@@ -47,14 +47,14 @@ includeall = False
 invtype = default
 inverterid = automatic
 mode = proxy
-grottip = 0.0.0.0
-grottport = ${LISTEN_PORT}
+ip = 0.0.0.0
+port = ${LISTEN_PORT}
 sendbuf = True
 timezone = local
 
 [Growatt]
-growattip = ${GROWATT_HOST}
-growattport = ${GROWATT_PORT}
+ip = ${GROWATT_HOST}
+port = ${GROWATT_PORT}
 
 [Server]
 httphost = 0.0.0.0
@@ -63,24 +63,24 @@ httptoken =
 
 [MQTT]
 nomqtt = False
-mqttip = ${MQTT_HOST}
-mqttport = ${MQTT_PORT}
-mqtttopic = ${MQTT_TOPIC}
-mqttmtopic = False
-mqttinverterintopic = False
-mqttretain = $( [ "${MQTT_RETAIN}" = "true" ] && echo True || echo False )
-mqttauth = ${MQTT_AUTH}
-mqttuser = ${MQTT_USER}
-mqttpsw = ${MQTT_PSW}
+ip = ${MQTT_HOST}
+port = ${MQTT_PORT}
+topic = ${MQTT_TOPIC}
+mtopic = False
+inverterintopic = False
+retain = $( [ "${MQTT_RETAIN}" = "true" ] && echo True || echo False )
+auth = ${MQTT_AUTH}
+user = ${MQTT_USER}
+password = ${MQTT_PSW}
 
 [PVOutput]
 pvoutput = False
 
-[InfluxDB]
+[influx]
 influx = False
 influx2 = False
 
-[Extension]
+[extension]
 extension = False
 EOF
 
@@ -93,8 +93,8 @@ if ! bashio::var.true "${FORWARD_TO_CLOUD}"; then
     SINK_PORT=5280
     bashio::log.info "Cloud forwarding disabled — starting local TCP sink on 127.0.0.1:${SINK_PORT}"
     python3 -u /opt/localsink.py "${SINK_PORT}" &
-    sed -i "s|^growattip = .*|growattip = 127.0.0.1|" "${CONF}"
-    sed -i "s|^growattport = .*|growattport = ${SINK_PORT}|" "${CONF}"
+    sed -i "/^\[Growatt\]/,/^\[/ s|^ip = .*|ip = 127.0.0.1|" "${CONF}"
+    sed -i "/^\[Growatt\]/,/^\[/ s|^port = .*|port = ${SINK_PORT}|" "${CONF}"
 fi
 
 bashio::log.info "Starting grott — listening on 0.0.0.0:${LISTEN_PORT}, HTTP API on :${HTTP_PORT}"
