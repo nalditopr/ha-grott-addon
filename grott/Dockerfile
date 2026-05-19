@@ -12,6 +12,7 @@ RUN apk add --no-cache \
         py3-requests \
         py3-yaml \
         git \
+        openssl \
         tzdata \
     && git clone --depth 1 --branch "${GROTT_REF}" \
         https://github.com/johanmeijer/grott.git "${GROTT_DIR}" \
