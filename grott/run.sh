@@ -92,8 +92,15 @@ fi
 
 if ! bashio::var.true "${FORWARD_TO_CLOUD}"; then
     SINK_PORT=5280
-    bashio::log.info "Cloud forwarding disabled — starting local TCP sink on 127.0.0.1:${SINK_PORT}"
-    python3 -u /opt/localsink.py "${SINK_PORT}" &
+    SINK_MODE="discard"
+    if bashio::var.true "${DEBUG_HEX}"; then
+        SINK_MODE="capture"
+        bashio::log.warning "localsink in CAPTURE mode — logging hex + echoing bytes (protocol RE)"
+    else
+        bashio::log.info "localsink in DISCARD mode — silently accepts grott forwards"
+    fi
+    bashio::log.info "Starting localsink on 127.0.0.1:${SINK_PORT}"
+    GROTT_SINK_MODE="${SINK_MODE}" python3 -u /opt/localsink.py "${SINK_PORT}" &
     sed -i "/^\[Growatt\]/,/^\[/ s|^ip = .*|ip = 127.0.0.1|" "${CONF}"
     sed -i "/^\[Growatt\]/,/^\[/ s|^port = .*|port = ${SINK_PORT}|" "${CONF}"
 fi
