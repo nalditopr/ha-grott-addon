@@ -55,6 +55,27 @@ MQTT_RETAIN = os.environ.get("GROTT_MQTT_RETAIN", "false").lower() == "true"
 
 _mqtt_client = None
 _mqtt_lock = threading.Lock()
+_ha_discovery_sent = False
+
+
+# Sensors to expose via HA MQTT discovery. Each entry:
+#   key — the field name in the energy/growatt/status JSON
+#   sensor config keys per HA spec (name, unit, device_class, state_class, icon)
+HA_SENSORS = [
+    {"key": "wifi_rssi", "name": "WiFi RSSI", "unit": "dBm",
+     "device_class": "signal_strength", "state_class": "measurement"},
+    {"key": "wifi_name", "name": "WiFi SSID", "icon": "mdi:wifi"},
+    {"key": "firmware", "name": "Firmware", "icon": "mdi:chip"},
+    {"key": "hardware_model", "name": "Hardware Model", "icon": "mdi:chip"},
+    {"key": "inverter_model", "name": "Inverter Model", "icon": "mdi:solar-power"},
+    {"key": "serial", "name": "Datalogger Serial", "icon": "mdi:barcode"},
+    {"key": "reset_reason", "name": "Last Reset Reason", "icon": "mdi:restart"},
+    {"key": "timezone", "name": "Timezone", "icon": "mdi:clock-outline"},
+    {"key": "device_timestamp_us", "name": "Device Timestamp µs",
+     "icon": "mdi:clock-digital"},
+    {"key": "frame_size", "name": "Last Frame Size", "unit": "B",
+     "state_class": "measurement", "icon": "mdi:format-size"},
+]
 
 
 def _ts() -> str:
@@ -115,6 +136,62 @@ def mqtt_publish(subtopic: str, payload: dict, cid: int = 0) -> None:
         _log(cid, f"MQTT publish failed: {e}")
 
 
+def ha_publish_discovery(meta: dict, cid: int) -> None:
+    """Send HA MQTT discovery configs so the status fields auto-create as sensors.
+
+    Idempotent: publishes once per process. Uses serial as device id; falls
+    back to a fixed id if serial is unknown.
+    """
+    global _ha_discovery_sent
+    if _ha_discovery_sent:
+        return
+    client = get_mqtt_client()
+    if client is None:
+        return
+    serial = meta.get("serial") or "unknown"
+    device_id = f"grott_{serial}"
+    device = {
+        "identifiers": [device_id],
+        "name": f"Grott Datalogger {serial}",
+        "manufacturer": "Vidagrid (Growatt OEM)",
+    }
+    if "hardware_model" in meta:
+        device["model"] = meta["hardware_model"]
+    if "firmware" in meta:
+        device["sw_version"] = meta["firmware"]
+
+    state_topic = f"{MQTT_TOPIC}/status"
+    sent = 0
+    for s in HA_SENSORS:
+        key = s["key"]
+        cfg = {
+            "name": s["name"],
+            "state_topic": state_topic,
+            "value_template": "{{ value_json." + key + " | default('') }}",
+            "unique_id": f"{device_id}_{key}",
+            "object_id": f"{device_id}_{key}",
+            "device": device,
+        }
+        if "unit" in s:
+            cfg["unit_of_measurement"] = s["unit"]
+        if "device_class" in s:
+            cfg["device_class"] = s["device_class"]
+        if "state_class" in s:
+            cfg["state_class"] = s["state_class"]
+        if "icon" in s:
+            cfg["icon"] = s["icon"]
+        topic = f"homeassistant/sensor/{device_id}/{key}/config"
+        try:
+            # Discovery configs MUST be retained so HA picks them up on restart
+            client.publish(topic, json.dumps(cfg), retain=True)
+            sent += 1
+        except Exception as e:
+            _log(cid, f"HA discovery publish failed for {key}: {e}")
+    if sent:
+        _ha_discovery_sent = True
+        _log(cid, f"HA discovery published — {sent} sensors as {device_id}")
+
+
 def extract_metadata(data: bytes) -> dict:
     """Extract known metadata strings from a 0x260f binary payload."""
     import re
@@ -123,13 +200,14 @@ def extract_metadata(data: bytes) -> dict:
 
     # WiFi info — binary payload has control bytes between fields,
     # so we scan for field name substrings and extract nearby text.
-    rssi_match = re.search(r'wifi_rssi[\x00-\x1f]*([-]?\d+)', text)
+    # Pattern is `field":"value"` with optional binary noise between them.
+    rssi_match = re.search(r'wifi_rssi"\s*:\s*[\x00-\x1f]*([-]?\d+)', text)
     if rssi_match:
         try:
             meta["wifi_rssi"] = int(rssi_match.group(1))
         except ValueError:
             pass
-    name_match = re.search(r'name[\x00-\x1f]*"([^"]+)"', text)
+    name_match = re.search(r'name"\s*:\s*"([^"]+)"', text)
     if name_match:
         meta["wifi_name"] = name_match.group(1)
 
@@ -232,6 +310,7 @@ def build_reply(data: bytes, cid: int) -> bytes:
             meta["frame_size"] = len(data)
             mqtt_publish("status", meta, cid)
             _log(cid, f"metadata: {meta!r}")
+            ha_publish_discovery(meta, cid)
         # Also publish raw hex for external decoders
         mqtt_publish("raw_hex", {"type": "0x260f", "hex": data.hex()}, cid)
         # Persist to disk for time-series comparison / RE
