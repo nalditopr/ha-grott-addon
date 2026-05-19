@@ -32,9 +32,13 @@ Verify by tailing the add-on log: you should see decoded frames within a couple 
 | `mqtt_topic` | `energy/growatt` | Base MQTT topic. Inverter SN gets appended. |
 | `mqtt_retain` | `false` | |
 | `verbose` | `true` | |
+| `mqtt_host` | `""` | Optional. If set, overrides Supervisor MQTT discovery — use to point at an external broker. |
+| `mqtt_port` | `1883` | Only used when `mqtt_host` is set. |
+| `mqtt_user` | `""` | Only used when `mqtt_host` is set. |
+| `mqtt_password` | `""` | Only used when `mqtt_host` is set. |
 | `extra_ini` | `""` | Raw INI text appended to `grott.ini` — for advanced sections (PVOutput, InfluxDB, Extension). |
 
-MQTT host/port/user/password are pulled automatically from the Supervisor MQTT service — no need to configure them here.
+By default MQTT host/port/user/password are pulled from the Supervisor MQTT service. For that to work the **Mosquitto broker** add-on must be running AND the **MQTT integration** must be added in **Settings → Devices & Services** (Supervisor reports `Service not enabled` until both are in place). Alternatively, set `mqtt_host` (and friends) to use any broker manually.
 
 ## Network
 

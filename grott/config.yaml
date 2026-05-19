@@ -30,6 +30,10 @@ options:
   mqtt_topic: energy/growatt
   mqtt_retain: false
   verbose: true
+  mqtt_host: ""
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
   extra_ini: ""
 schema:
   forward_to_cloud: bool
@@ -40,4 +44,8 @@ schema:
   mqtt_topic: str
   mqtt_retain: bool
   verbose: bool
+  mqtt_host: str?
+  mqtt_port: port?
+  mqtt_user: str?
+  mqtt_password: password?
   extra_ini: str?
