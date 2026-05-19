@@ -136,7 +136,7 @@ def build_reply(data: bytes, cid: int) -> bytes:
     if isinstance(parsed, dict):
         mqtt_publish("raw", {"type": msg_type, "data": parsed}, cid)
 
-    ack = {"result": 0, "time": int(time.time())}
+    ack = {"result": 1, "time": int(time.time())}
     if isinstance(parsed, dict):
         # Echo back all fields the dongle sent — some devices expect
         # sign/uptime/others to be mirrored in the ack.
