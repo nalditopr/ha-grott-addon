@@ -115,6 +115,62 @@ def mqtt_publish(subtopic: str, payload: dict, cid: int = 0) -> None:
         _log(cid, f"MQTT publish failed: {e}")
 
 
+def extract_metadata(data: bytes) -> dict:
+    """Extract known metadata strings from a 0x260f binary payload."""
+    import re
+    text = data.decode("latin-1", errors="ignore")
+    meta = {}
+
+    # WiFi info from embedded JSON fragment
+    wifi_match = re.search(r'\{[^}]*"wifi_rssi"[^}]*\}', text)
+    if wifi_match:
+        try:
+            wifi_json = json.loads(wifi_match.group())
+            meta["wifi_rssi"] = wifi_json.get("wifi_rssi")
+            meta["wifi_name"] = wifi_json.get("name")
+        except Exception:
+            pass
+
+    # Firmware version: pattern like x.x.x.x
+    fw_match = re.search(r'(\d+\.\d+\.\d+(?:\.\d+)?)', text)
+    if fw_match:
+        meta["firmware"] = fw_match.group(1)
+
+    # Model / serial patterns
+    if "VC510103" in text:
+        meta["hardware_model"] = "VC510103"
+    if "VZP1N8602Z" in text:
+        meta["inverter_model"] = "VZP1N8602Z"
+
+    # Serial number: digits after VC510103
+    serial_match = re.search(r'VC510103[^0-9]*(\d{6,})', text)
+    if serial_match:
+        meta["serial"] = serial_match.group(1)
+
+    # Reset reason
+    if "ESP_RST_" in text:
+        rst_match = re.search(r'ESP_RST_\w+', text)
+        if rst_match:
+            meta["reset_reason"] = rst_match.group()
+
+    # Timezone
+    tz_match = re.search(r'GMT[+-]\d+', text)
+    if tz_match:
+        meta["timezone"] = tz_match.group()
+
+    # Timestamp at end of payload: [1234567890123]
+    ts_match = re.search(r'\[(\d{13,16})\]', text)
+    if ts_match:
+        meta["device_timestamp_us"] = int(ts_match.group(1))
+
+    # MAC address fragments (best effort)
+    mac_match = re.search(r'mac\s+([0-9A-Fa-f:]+)', text)
+    if mac_match:
+        meta["mac"] = mac_match.group(1)
+
+    return meta
+
+
 def build_reply(data: bytes, cid: int) -> bytes:
     """Guess an appropriate framed JSON ack based on the request."""
     if len(data) < 6:
@@ -147,6 +203,15 @@ def build_reply(data: bytes, cid: int) -> bytes:
         now_us = int(time.time() * 1_000_000)
         ack_body = json.dumps([now_us, now_us + 60_000_000], separators=(",", ":")).encode("utf-8")
         reply_type = 0x2302
+        # Extract and publish metadata from the binary payload
+        meta = extract_metadata(data)
+        if meta:
+            meta["frame_type"] = "0x260f"
+            meta["frame_size"] = len(data)
+            mqtt_publish("status", meta, cid)
+            _log(cid, f"metadata: {meta!r}")
+        # Also publish raw hex for external decoders
+        mqtt_publish("raw_hex", {"type": "0x260f", "hex": data.hex()}, cid)
     else:
         # Generic fallback for unknown message types
         ack = {"result": 1, "time": int(time.time())}
