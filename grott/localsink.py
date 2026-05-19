@@ -121,30 +121,17 @@ def extract_metadata(data: bytes) -> dict:
     text = data.decode("latin-1", errors="ignore")
     meta = {}
 
-    # WiFi info from embedded JSON fragment
-    wifi_match = re.search(r'\{[^}]*"wifi_rssi"[^}]*\}', text)
-    if wifi_match:
+    # WiFi info — binary payload has control bytes between fields,
+    # so we scan for field name substrings and extract nearby text.
+    rssi_match = re.search(r'wifi_rssi[\x00-\x1f]*([-]?\d+)', text)
+    if rssi_match:
         try:
-            wifi_json = json.loads(wifi_match.group())
-            rssi = wifi_json.get("wifi_rssi")
-            if isinstance(rssi, str):
-                rssi = ''.join(c for c in rssi if c.isdigit() or c in '-.')
-            meta["wifi_rssi"] = int(rssi) if rssi else None
-            meta["wifi_name"] = wifi_json.get("name")
-        except Exception:
+            meta["wifi_rssi"] = int(rssi_match.group(1))
+        except ValueError:
             pass
-    else:
-        # Fallback: search for rssi and name separately
-        rssi_match = re.search(r'"wifi_rssi"\s*:\s*([^,}]+)', text)
-        if rssi_match:
-            rssi_str = ''.join(c for c in rssi_match.group(1) if c.isdigit() or c == '-')
-            try:
-                meta["wifi_rssi"] = int(rssi_str)
-            except ValueError:
-                pass
-        name_match = re.search(r'"name"\s*:\s*"([^"]+)"', text)
-        if name_match:
-            meta["wifi_name"] = name_match.group(1)
+    name_match = re.search(r'name[\x00-\x1f]*"([^"]+)"', text)
+    if name_match:
+        meta["wifi_name"] = name_match.group(1)
 
     # Firmware version: pattern like x.x.x.x
     fw_match = re.search(r'(\d+\.\d+\.\d+(?:\.\d+)?)', text)
