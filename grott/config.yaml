@@ -1,0 +1,43 @@
+name: Grott
+version: "0.1.0"
+slug: grott
+description: Local proxy + MQTT bridge for Growatt solar inverters
+url: https://github.com/nalditopr/ha-grott-addon/tree/main/grott
+arch:
+  - aarch64
+  - amd64
+  - armv7
+  - armhf
+  - i386
+init: false
+startup: services
+boot: auto
+host_network: false
+ports:
+  5279/tcp: 5279
+  5782/tcp: 5782
+ports_description:
+  5279/tcp: Datalogger ingress — point the Growatt stick here
+  5782/tcp: Grott HTTP API
+services:
+  - mqtt:need
+options:
+  forward_to_cloud: false
+  growatt_cloud_host: server.growatt.com
+  growatt_cloud_port: 5279
+  grott_listen_port: 5279
+  http_api_port: 5782
+  mqtt_topic: energy/growatt
+  mqtt_retain: false
+  verbose: true
+  extra_ini: ""
+schema:
+  forward_to_cloud: bool
+  growatt_cloud_host: str
+  growatt_cloud_port: port
+  grott_listen_port: port
+  http_api_port: port
+  mqtt_topic: str
+  mqtt_retain: bool
+  verbose: bool
+  extra_ini: str?
