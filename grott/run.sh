@@ -37,6 +37,30 @@ if [ -n "${MQTT_USER}" ]; then
     MQTT_AUTH=True
 fi
 
+# Export MQTT vars so localsink.py can publish directly
+export GROTT_MQTT_HOST="${MQTT_HOST}"
+export GROTT_MQTT_PORT="${MQTT_PORT}"
+export GROTT_MQTT_TOPIC="${MQTT_TOPIC}"
+export GROTT_MQTT_USER="${MQTT_USER}"
+export GROTT_MQTT_PSW="${MQTT_PSW}"
+export GROTT_MQTT_RETAIN="${MQTT_RETAIN}"
+
+# Determine operating mode
+TLS_DIRECT_MODE=false
+if ! bashio::var.true "${FORWARD_TO_CLOUD}" && bashio::var.true "${DEBUG_HEX}"; then
+    TLS_DIRECT_MODE=true
+    bashio::log.warning "TLS DIRECT MODE — localsink will listen on 0.0.0.0:${LISTEN_PORT} and handle TLS dongles directly"
+fi
+
+if bashio::var.true "${TLS_DIRECT_MODE}"; then
+    # In TLS direct mode localsink owns the datalogger port.
+    # Move grott to an internal port so its HTTP API still works.
+    GROTT_LISTEN_INTERNAL=5278
+    bashio::log.info "grott proxy moved to internal port ${GROTT_LISTEN_INTERNAL} (HTTP API stays on :${HTTP_PORT})"
+else
+    GROTT_LISTEN_INTERNAL="${LISTEN_PORT}"
+fi
+
 cat >"${CONF}" <<EOF
 [Generic]
 minrecl = 100
@@ -49,7 +73,7 @@ invtype = default
 inverterid = automatic
 mode = proxy
 ip = 0.0.0.0
-port = ${LISTEN_PORT}
+port = ${GROTT_LISTEN_INTERNAL}
 sendbuf = True
 timezone = local
 
@@ -93,16 +117,34 @@ fi
 if ! bashio::var.true "${FORWARD_TO_CLOUD}"; then
     SINK_PORT=5280
     SINK_MODE="discard"
+    SINK_BIND="127.0.0.1"
     if bashio::var.true "${DEBUG_HEX}"; then
         SINK_MODE="capture"
         bashio::log.warning "localsink in CAPTURE mode — logging hex + echoing bytes (protocol RE)"
     else
         bashio::log.info "localsink in DISCARD mode — silently accepts grott forwards"
     fi
-    bashio::log.info "Starting localsink on 127.0.0.1:${SINK_PORT}"
-    GROTT_SINK_MODE="${SINK_MODE}" python3 -u /opt/localsink.py "${SINK_PORT}" &
-    sed -i "/^\[Growatt\]/,/^\[/ s|^ip = .*|ip = 127.0.0.1|" "${CONF}"
-    sed -i "/^\[Growatt\]/,/^\[/ s|^port = .*|port = ${SINK_PORT}|" "${CONF}"
+
+    if bashio::var.true "${TLS_DIRECT_MODE}"; then
+        # localsink becomes the public endpoint
+        SINK_PORT="${LISTEN_PORT}"
+        SINK_BIND="0.0.0.0"
+        bashio::log.info "Starting localsink on ${SINK_BIND}:${SINK_PORT} (TLS direct mode)"
+        GROTT_SINK_MODE="${SINK_MODE}" python3 -u /opt/localsink.py "${SINK_PORT}" "${SINK_BIND}" &
+        # Point grott's forward target at a discard sink on a different port
+        # so grott's proxy tunnel has somewhere to go (even though nothing
+        # should reach it in direct mode).
+        LOCALSINK_INTERNAL=5280
+        bashio::log.info "Starting internal discard sink on 127.0.0.1:${LOCALSINK_INTERNAL} for grott"
+        GROTT_SINK_MODE="discard" python3 -u /opt/localsink.py "${LOCALSINK_INTERNAL}" "127.0.0.1" &
+        sed -i "/^\[Growatt\]/,/^\[/ s|^ip = .*|ip = 127.0.0.1|" "${CONF}"
+        sed -i "/^\[Growatt\]/,/^\[/ s|^port = .*|port = ${LOCALSINK_INTERNAL}|" "${CONF}"
+    else
+        bashio::log.info "Starting localsink on ${SINK_BIND}:${SINK_PORT}"
+        GROTT_SINK_MODE="${SINK_MODE}" python3 -u /opt/localsink.py "${SINK_PORT}" "${SINK_BIND}" &
+        sed -i "/^\[Growatt\]/,/^\[/ s|^ip = .*|ip = 127.0.0.1|" "${CONF}"
+        sed -i "/^\[Growatt\]/,/^\[/ s|^port = .*|port = ${SINK_PORT}|" "${CONF}"
+    fi
 fi
 
 if bashio::var.true "${DEBUG_HEX}"; then
@@ -129,6 +171,6 @@ print("grottproxy.py patched for debug_hex")
 PY
 fi
 
-bashio::log.info "Starting grott — listening on 0.0.0.0:${LISTEN_PORT}, HTTP API on :${HTTP_PORT}"
+bashio::log.info "Starting grott — listening on 0.0.0.0:${GROTT_LISTEN_INTERNAL}, HTTP API on :${HTTP_PORT}"
 cd /opt/grott
 exec python3 -u grott.py -v
