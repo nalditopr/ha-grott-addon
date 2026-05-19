@@ -13,14 +13,21 @@ MQTT_RETAIN="$(bashio::config 'mqtt_retain')"
 VERBOSE="$(bashio::config 'verbose')"
 EXTRA_INI="$(bashio::config 'extra_ini')"
 
-if bashio::services.available "mqtt"; then
+MANUAL_HOST="$(bashio::config 'mqtt_host')"
+if [ -n "${MANUAL_HOST}" ]; then
+    MQTT_HOST="${MANUAL_HOST}"
+    MQTT_PORT="$(bashio::config 'mqtt_port')"
+    MQTT_USER="$(bashio::config 'mqtt_user')"
+    MQTT_PSW="$(bashio::config 'mqtt_password')"
+    bashio::log.info "Using manually-configured MQTT at ${MQTT_HOST}:${MQTT_PORT}"
+elif bashio::services.available "mqtt"; then
     MQTT_HOST="$(bashio::services 'mqtt' 'host')"
     MQTT_PORT="$(bashio::services 'mqtt' 'port')"
     MQTT_USER="$(bashio::services 'mqtt' 'username')"
     MQTT_PSW="$(bashio::services 'mqtt' 'password')"
     bashio::log.info "Using Supervisor-provided MQTT service at ${MQTT_HOST}:${MQTT_PORT}"
 else
-    bashio::log.fatal "No MQTT service available. Install and configure the Mosquitto broker add-on."
+    bashio::log.fatal "No MQTT available. Either: (a) install + start Mosquitto broker AND add the MQTT integration in Settings → Devices & Services, or (b) set mqtt_host/mqtt_port/mqtt_user/mqtt_password in this add-on's Configuration tab."
     exit 1
 fi
 
