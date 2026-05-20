@@ -112,6 +112,8 @@ HA_TELEMETRY_SENSORS = [
      "device_class": "voltage", "state_class": "measurement"},
     {"key": "battery_voltage", "name": "Battery Voltage", "unit": "V", "topic": "telemetry",
      "device_class": "voltage", "state_class": "measurement"},
+    {"key": "battery_soc", "name": "Battery SOC", "unit": "%", "topic": "telemetry",
+     "device_class": "battery", "state_class": "measurement"},
 ]
 
 
@@ -344,6 +346,34 @@ def extract_metadata(data: bytes) -> dict:
     return meta
 
 
+# LiFePO4 pack SOC vs voltage, anchored to THIS inverter's own battery settings
+# (from the Battery Settings screen): Float 52.0 V = full = 100%, LBCO (Low
+# Battery Cut-Off) 46.0 V = empty = 0%, LBCO-Alarm 47.5 V ≈ low. The inverter
+# has no separate SOC register — it derives state-of-charge from pack voltage
+# against these thresholds, which is why SOC never appeared in the byte stream.
+# Curve follows the LiFePO4 shape (gentle plateau through the mid/upper band)
+# rather than a straight line. Piecewise-linear; tune breakpoints against the
+# display if needed. Voltage under charge reads high (clamped to 100).
+LIFEPO4_SOC_CURVE = [
+    (46.0, 0), (47.0, 8), (47.5, 13), (48.0, 20), (48.5, 28),
+    (49.0, 37), (49.5, 47), (50.0, 57), (50.5, 68), (51.0, 79),
+    (51.5, 90), (52.0, 100),
+]
+
+
+def soc_from_voltage(v: float) -> int:
+    """Map pack voltage to SOC% via the LiFePO4 curve (piecewise-linear, clamped)."""
+    pts = LIFEPO4_SOC_CURVE
+    if v <= pts[0][0]:
+        return pts[0][1]
+    if v >= pts[-1][0]:
+        return pts[-1][1]
+    for (v0, s0), (v1, s1) in zip(pts, pts[1:]):
+        if v0 <= v <= v1:
+            return round(s0 + (s1 - s0) * (v - v0) / (v1 - v0))
+    return pts[-1][1]
+
+
 def decode_telemetry(data: bytes) -> dict:
     """Decode live PV telemetry from the 2nd (live) 0x260f message.
 
@@ -444,8 +474,13 @@ def decode_telemetry(data: bytes) -> dict:
             # pack voltage (raw diff ~96-108, verified across the night); require
             # that to reject daytime garbage. Net effect: battery_voltage is
             # published only when trustworthy (reliably overnight).
-            if 45.0 <= batt <= 55.0 and 85 <= (f1 - batt_raw) <= 120:
+            # Range is the inverter's real operating window: LBCO 46.0 V (empty)
+            # to just above Float 52.0 V (full); allow a little headroom for
+            # absorption/equalization charge voltage.
+            if 45.5 <= batt <= 54.5 and 85 <= (f1 - batt_raw) <= 120:
                 result["battery_voltage"] = round(batt, 1)
+                # SOC is voltage-derived (no dedicated register on this inverter).
+                result["battery_soc"] = soc_from_voltage(batt)
 
     return result
 
