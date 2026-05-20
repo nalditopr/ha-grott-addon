@@ -102,6 +102,12 @@ HA_TELEMETRY_SENSORS = [
      "device_class": "power", "state_class": "measurement"},
     {"key": "pv2_voltage", "name": "PV2 Voltage", "unit": "V", "topic": "telemetry",
      "device_class": "voltage", "state_class": "measurement"},
+    {"key": "grid_frequency", "name": "Grid Frequency", "unit": "Hz", "topic": "telemetry",
+     "device_class": "frequency", "state_class": "measurement"},
+    {"key": "grid_voltage", "name": "Grid Voltage", "unit": "V", "topic": "telemetry",
+     "device_class": "voltage", "state_class": "measurement"},
+    {"key": "battery_voltage", "name": "Battery Voltage", "unit": "V", "topic": "telemetry",
+     "device_class": "voltage", "state_class": "measurement"},
 ]
 
 
@@ -353,21 +359,53 @@ def decode_telemetry(data: bytes) -> dict:
         vpv2 = struct.unpack_from(">H", body, 17)[0] / 10.0
     except struct.error:
         return {}
-    # Sanity ranges (reject drifted alignment rather than publish garbage)
+    # Sanity ranges (reject drifted alignment rather than publish garbage).
+    # Vpv2 is checked separately below — it sits one field later and its offset
+    # occasionally drifts at night, so a bad Vpv2 shouldn't sink the whole frame.
     if not (0 <= ppv <= 60000 and 0 <= vpv1 <= 1000 and 0 <= ipv1 <= 100
-            and 0 <= ppv1 <= 60000 and 0 <= vpv2 <= 1000):
+            and 0 <= ppv1 <= 60000):
         return {}
     # P = V*I cross-check on string 1 (the proof the offsets are right)
     vi = vpv1 * ipv1
     if ppv1 > 50 and abs(vi - ppv1) > max(60, 0.30 * ppv1):
         return {}
-    return {
+    result = {
         "pv_power": round(ppv, 1),
         "pv1_voltage": round(vpv1, 1),
         "pv1_current": round(ipv1, 1),
         "pv1_power": round(ppv1, 1),
-        "pv2_voltage": round(vpv2, 1),
     }
+    if 0 <= vpv2 <= 500:  # plausible PV string voltage; drop drifted reads
+        result["pv2_voltage"] = round(vpv2, 1)
+
+    # --- Grid block (anchored, since the variable-length PV region shifts it) ---
+    # Grid frequency is a near-constant ~60.00 Hz (/100), a perfect anchor: scan
+    # past the PV block for a value in 59-61 Hz, then grid voltage sits 2 bytes
+    # after it (/10 V). Validated every frame: ~60.0 Hz, 121-125 V (PR 120V).
+    for i in range(30, len(body) - 3):
+        f = struct.unpack_from(">H", body, i)[0]
+        if 5900 <= f <= 6100:
+            vac = struct.unpack_from(">H", body, i + 2)[0]
+            if 900 <= vac <= 2700:  # 90-270 V
+                result["grid_frequency"] = round(f / 100.0, 2)
+                result["grid_voltage"] = round(vac / 10.0, 1)
+                break
+
+    # --- Battery voltage (anchored) ---
+    # Battery block: marker `00 07 b8`, then a counter byte, then a 3-value
+    # sandwich `02 XX  01 BATT  02 XX` (BATT = pack voltage /10 V). The matching
+    # flanks confirm alignment; require a sane 48V-bank range. Reliable at night;
+    # daytime alignment occasionally drifts (then guards skip rather than emit).
+    anc = body.find(b"\x00\x07\xb8")
+    if anc >= 0 and anc + 10 <= len(body):
+        if (body[anc + 4] == 0x02 and body[anc + 6] == 0x01
+                and struct.unpack_from(">H", body, anc + 4)[0]
+                == struct.unpack_from(">H", body, anc + 8)[0]):
+            batt = struct.unpack_from(">H", body, anc + 6)[0] / 10.0
+            if 45.0 <= batt <= 55.0:
+                result["battery_voltage"] = round(batt, 1)
+
+    return result
 
 
 def publish_telemetry(data: bytes, cid: int) -> None:
