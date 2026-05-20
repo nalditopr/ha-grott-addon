@@ -469,6 +469,9 @@ def handle_mitm(conn: socket.socket, addr, cid: int, ssl_ctx: ssl.SSLContext) ->
 
 def _shuttle_tls(tls_in, tls_up, cid: int) -> None:
     stop = threading.Event()
+    # Per-connection-per-direction buffer of EVERY byte seen.
+    # Written out as one file per direction on connection close.
+    buffers = {"DONGLE→SRV": bytearray(), "SRV→DONGLE": bytearray()}
 
     def pump(src, dst, label):
         try:
@@ -481,12 +484,16 @@ def _shuttle_tls(tls_in, tls_up, cid: int) -> None:
                 if not data:
                     _log(cid, f"{label} EOF")
                     break
-                _log(cid, f"{label} {len(data)}B: {hexdump(data)}")
+                # Hexdump only the first 200B to avoid log spam on huge frames
+                preview = data[:200]
+                more = "" if len(data) <= 200 else f" ...+{len(data)-200}B"
+                _log(cid, f"{label} {len(data)}B: {hexdump(preview)}{more}")
                 try:
                     dst.sendall(data)
                 except OSError as e:
                     _log(cid, f"{label} send error: {e}")
                     break
+                buffers[label].extend(data)
                 try:
                     _observe_frame(data, cid, label)
                 except Exception as e:
@@ -498,6 +505,25 @@ def _shuttle_tls(tls_in, tls_up, cid: int) -> None:
     t2 = threading.Thread(target=pump, args=(tls_up, tls_in, "SRV→DONGLE"), daemon=True)
     t1.start(); t2.start()
     t1.join(); t2.join()
+
+    # Persist full transcripts for offline analysis
+    try:
+        import pathlib
+        d = pathlib.Path("/data/mitm")
+        d.mkdir(exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        for label, buf in buffers.items():
+            if not buf:
+                continue
+            side = "dongle_to_srv" if label.startswith("DONGLE") else "srv_to_dongle"
+            (d / f"{ts}_conn{cid}_{side}.bin").write_bytes(bytes(buf))
+        _log(cid, f"transcripts saved — D→S {len(buffers['DONGLE→SRV'])}B, S→D {len(buffers['SRV→DONGLE'])}B")
+        # Rotate: keep last 50 connections (100 files)
+        files = sorted(d.glob("*.bin"), key=lambda p: p.stat().st_mtime)
+        for old in files[:-100]:
+            old.unlink(missing_ok=True)
+    except OSError as e:
+        _log(cid, f"transcript persist failed: {e}")
 
 
 def _shuttle_plain(c_in, c_out, cid: int) -> None:
