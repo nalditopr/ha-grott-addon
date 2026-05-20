@@ -102,12 +102,28 @@ HA_TELEMETRY_SENSORS = [
      "device_class": "power", "state_class": "measurement"},
     {"key": "pv2_voltage", "name": "PV2 Voltage", "unit": "V", "topic": "telemetry",
      "device_class": "voltage", "state_class": "measurement"},
+    {"key": "pv2_current", "name": "PV2 Current", "unit": "A", "topic": "telemetry",
+     "device_class": "current", "state_class": "measurement"},
+    {"key": "pv2_power", "name": "PV2 Power", "unit": "W", "topic": "telemetry",
+     "device_class": "power", "state_class": "measurement"},
     {"key": "grid_frequency", "name": "Grid Frequency", "unit": "Hz", "topic": "telemetry",
      "device_class": "frequency", "state_class": "measurement"},
     {"key": "grid_voltage", "name": "Grid Voltage", "unit": "V", "topic": "telemetry",
      "device_class": "voltage", "state_class": "measurement"},
     {"key": "battery_voltage", "name": "Battery Voltage", "unit": "V", "topic": "telemetry",
      "device_class": "voltage", "state_class": "measurement"},
+]
+
+
+# Stale discovery keys from old experimental versions (v0.6.5 "candidate"
+# sensors) that were never real telemetry. Their retained discovery configs
+# linger on the broker and show as dead entities under the device — purge them
+# once on startup by publishing an empty retained payload to each config topic.
+STALE_DISCOVERY_KEYS = [
+    "candidate_ac_v_a", "candidate_ac_v_b", "candidate_ac_v_c", "candidate_ac_v_d",
+    "candidate_bat_v_a", "candidate_bat_v_b", "candidate_bat_v_c",
+    "candidate_bat_v_d", "candidate_bat_v_e", "candidate_bat_v_f",
+    "candidate_soc_a", "candidate_soc_b", "candidate_soc_c", "candidate_soc_d",
 ]
 
 
@@ -225,9 +241,20 @@ def ha_publish_discovery(meta: dict, cid: int) -> None:
             sent += 1
         except Exception as e:
             _log(cid, f"HA discovery publish failed for {key}: {e}")
+    # Purge stale "candidate" discovery configs from old versions (idempotent).
+    purged = 0
+    for key in STALE_DISCOVERY_KEYS:
+        topic = f"homeassistant/sensor/{device_id}/{key}/config"
+        try:
+            client.publish(topic, "", retain=True)
+            purged += 1
+        except Exception:
+            pass
+
     if sent:
         _ha_discovery_sent = True
-        _log(cid, f"HA discovery published — {sent} sensors as {device_id}")
+        _log(cid, f"HA discovery published — {sent} sensors as {device_id}"
+                  f" ({purged} stale topics purged)")
 
 
 def extract_metadata(data: bytes) -> dict:
@@ -377,6 +404,14 @@ def decode_telemetry(data: bytes) -> dict:
     }
     if 0 <= vpv2 <= 500:  # plausible PV string voltage; drop drifted reads
         result["pv2_voltage"] = round(vpv2, 1)
+    # Derived PV2 power/current. The dongle emits Ppv (total) and Ppv1 (string 1)
+    # but NOT Ipv2/Ppv2 at any decodable position. For this 2-MPPT array,
+    # Ppv2 = Ppv - Ppv1 and Ipv2 = Ppv2 / Vpv2 — both follow exactly from the
+    # already-validated fields, so they're as reliable as Ppv/Ppv1/Vpv2.
+    pv2_power = round(max(0.0, ppv - ppv1), 1)
+    result["pv2_power"] = pv2_power
+    if result.get("pv2_voltage", 0) > 10:
+        result["pv2_current"] = round(pv2_power / result["pv2_voltage"], 1)
 
     # --- Grid block (anchored, since the variable-length PV region shifts it) ---
     # Grid frequency is a near-constant ~60.00 Hz (/100), a perfect anchor: scan
@@ -401,8 +436,15 @@ def decode_telemetry(data: bytes) -> dict:
         if (body[anc + 4] == 0x02 and body[anc + 6] == 0x01
                 and struct.unpack_from(">H", body, anc + 4)[0]
                 == struct.unpack_from(">H", body, anc + 8)[0]):
-            batt = struct.unpack_from(">H", body, anc + 6)[0] / 10.0
-            if 45.0 <= batt <= 55.0:
+            f1 = struct.unpack_from(">H", body, anc + 4)[0]
+            batt_raw = struct.unpack_from(">H", body, anc + 6)[0]
+            batt = batt_raw / 10.0
+            # Daytime alignment drifts and yields coincidental sandwich matches.
+            # At a genuine battery block the upper flank F1 sits ~10 V above the
+            # pack voltage (raw diff ~96-108, verified across the night); require
+            # that to reject daytime garbage. Net effect: battery_voltage is
+            # published only when trustworthy (reliably overnight).
+            if 45.0 <= batt <= 55.0 and 85 <= (f1 - batt_raw) <= 120:
                 result["battery_voltage"] = round(batt, 1)
 
     return result
