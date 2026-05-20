@@ -12,6 +12,8 @@ MQTT_TOPIC="$(bashio::config 'mqtt_topic')"
 MQTT_RETAIN="$(bashio::config 'mqtt_retain')"
 VERBOSE="$(bashio::config 'verbose')"
 DEBUG_HEX="$(bashio::config 'debug_hex')"
+MITM_UPSTREAM_HOST="$(bashio::config 'mitm_upstream_host')"
+MITM_UPSTREAM_PORT="$(bashio::config 'mitm_upstream_port')"
 EXTRA_INI="$(bashio::config 'extra_ini')"
 
 MANUAL_HOST="$(bashio::config 'mqtt_host')"
@@ -47,7 +49,12 @@ export GROTT_MQTT_RETAIN="${MQTT_RETAIN}"
 
 # Determine operating mode
 TLS_DIRECT_MODE=false
-if ! bashio::var.true "${FORWARD_TO_CLOUD}" && bashio::var.true "${DEBUG_HEX}"; then
+MITM_MODE=false
+if [ -n "${MITM_UPSTREAM_HOST}" ]; then
+    MITM_MODE=true
+    TLS_DIRECT_MODE=true
+    bashio::log.warning "TLS MITM MODE — forwarding to ${MITM_UPSTREAM_HOST}:${MITM_UPSTREAM_PORT}"
+elif ! bashio::var.true "${FORWARD_TO_CLOUD}" && bashio::var.true "${DEBUG_HEX}"; then
     TLS_DIRECT_MODE=true
     bashio::log.warning "TLS DIRECT MODE — localsink will listen on 0.0.0.0:${LISTEN_PORT} and handle TLS dongles directly"
 fi
@@ -118,7 +125,12 @@ if ! bashio::var.true "${FORWARD_TO_CLOUD}"; then
     SINK_PORT=5280
     SINK_MODE="discard"
     SINK_BIND="127.0.0.1"
-    if bashio::var.true "${DEBUG_HEX}"; then
+    if bashio::var.true "${MITM_MODE}"; then
+        SINK_MODE="mitm"
+        export GROTT_MITM_HOST="${MITM_UPSTREAM_HOST}"
+        export GROTT_MITM_PORT="${MITM_UPSTREAM_PORT}"
+        bashio::log.warning "localsink in MITM mode — upstream ${GROTT_MITM_HOST}:${GROTT_MITM_PORT}"
+    elif bashio::var.true "${DEBUG_HEX}"; then
         SINK_MODE="capture"
         bashio::log.warning "localsink in CAPTURE mode — logging hex + echoing bytes (protocol RE)"
     else

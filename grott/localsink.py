@@ -45,6 +45,12 @@ CERT_PATH = "/data/sink_cert.pem"
 KEY_PATH = "/data/sink_key.pem"
 CERT_CN = os.environ.get("GROTT_SINK_CN", "gw-solar-dc.vidagrid.com")
 
+# MITM upstream — when set, terminates TLS, opens parallel TLS to upstream,
+# and shuttles bytes both ways (logging + MQTT publish). Bypasses local
+# reply generation. Use to observe the real cloud's responses.
+MITM_HOST = os.environ.get("GROTT_MITM_HOST", "").strip()
+MITM_PORT = int(os.environ.get("GROTT_MITM_PORT", "0") or "0")
+
 # MQTT config from environment (injected by run.sh)
 MQTT_HOST = os.environ.get("GROTT_MQTT_HOST", "")
 MQTT_PORT = int(os.environ.get("GROTT_MQTT_PORT", "1883"))
@@ -353,6 +359,173 @@ def make_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def make_client_ssl_context() -> ssl.SSLContext:
+    """Outbound TLS — disable cert verification (upstream may use a private CA)."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_ciphers("ALL:@SECLEVEL=0")
+    except ssl.SSLError:
+        pass
+    return ctx
+
+
+def _observe_frame(data: bytes, cid: int, direction: str) -> None:
+    """Best-effort frame parse + MQTT publish for an observed buffer."""
+    if len(data) < 6:
+        return
+    msg_type, msg_len = struct.unpack(">HI", data[:6])
+    body = data[6:6 + msg_len]
+    _log(cid, f"{direction} parsed type=0x{msg_type:04x} length={msg_len} body_bytes={len(body)}")
+    parsed = None
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+        _log(cid, f"{direction} JSON: {parsed!r}")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        pass
+    sub = "mitm_dongle" if direction == "DONGLE→SRV" else "mitm_server"
+    if isinstance(parsed, dict):
+        mqtt_publish(sub, {"type": f"0x{msg_type:04x}", "data": parsed}, cid)
+    elif isinstance(parsed, list):
+        mqtt_publish(sub, {"type": f"0x{msg_type:04x}", "data": parsed}, cid)
+    if msg_type == 0x260f and direction == "DONGLE→SRV":
+        meta = extract_metadata(data)
+        if meta:
+            meta["frame_type"] = "0x260f"
+            meta["frame_size"] = len(data)
+            mqtt_publish("status", meta, cid)
+            ha_publish_discovery(meta, cid)
+        mqtt_publish("raw_hex", {"type": "0x260f", "hex": data.hex()}, cid)
+        log_frame(data, meta or {}, cid)
+
+
+def handle_mitm(conn: socket.socket, addr, cid: int, ssl_ctx: ssl.SSLContext) -> None:
+    """TLS MITM: accept dongle TLS, open TLS to upstream, shuttle + observe both ways."""
+    _log(cid, f"OPEN (MITM) from {addr[0]}:{addr[1]} → {MITM_HOST}:{MITM_PORT}")
+    tls_in = None
+    tls_up = None
+    try:
+        conn.settimeout(30)
+        try:
+            head = conn.recv(1, socket.MSG_PEEK)
+        except OSError as e:
+            _log(cid, f"peek failed: {e}")
+            return
+        if not head:
+            _log(cid, "EOF before any data")
+            return
+        if head != b"\x16":
+            _log(cid, f"first byte 0x{head.hex()} — not TLS, falling back to plain pass-through")
+            # Plain TCP pass-through to upstream (no TLS either direction)
+            try:
+                up_raw = socket.create_connection((MITM_HOST, MITM_PORT), timeout=10)
+            except OSError as e:
+                _log(cid, f"upstream connect failed: {e}")
+                return
+            _shuttle_plain(conn, up_raw, cid)
+            return
+
+        # Accept dongle TLS
+        try:
+            tls_in = ssl_ctx.wrap_socket(conn, server_side=True, do_handshake_on_connect=True)
+        except (ssl.SSLError, OSError) as e:
+            _log(cid, f"dongle TLS handshake failed: {e}")
+            return
+        try:
+            _log(cid, f"dongle TLS OK — {tls_in.version()} {tls_in.cipher()}")
+        except Exception:
+            pass
+
+        # Open upstream TCP + TLS
+        try:
+            up_raw = socket.create_connection((MITM_HOST, MITM_PORT), timeout=10)
+        except OSError as e:
+            _log(cid, f"upstream connect failed: {e}")
+            return
+        client_ctx = make_client_ssl_context()
+        try:
+            tls_up = client_ctx.wrap_socket(up_raw, server_hostname=None)
+        except (ssl.SSLError, OSError) as e:
+            _log(cid, f"upstream TLS handshake failed: {e}")
+            return
+        try:
+            _log(cid, f"upstream TLS OK — {tls_up.version()} {tls_up.cipher()}")
+        except Exception:
+            pass
+
+        _shuttle_tls(tls_in, tls_up, cid)
+    except OSError as e:
+        _log(cid, f"socket error: {e}")
+    finally:
+        _log(cid, "CLOSE")
+        for s in (tls_in, tls_up):
+            try:
+                if s is not None:
+                    s.close()
+            except OSError:
+                pass
+
+
+def _shuttle_tls(tls_in, tls_up, cid: int) -> None:
+    stop = threading.Event()
+
+    def pump(src, dst, label):
+        try:
+            while not stop.is_set():
+                try:
+                    data = src.recv(16384)
+                except OSError as e:
+                    _log(cid, f"{label} recv error: {e}")
+                    break
+                if not data:
+                    _log(cid, f"{label} EOF")
+                    break
+                _log(cid, f"{label} {len(data)}B: {hexdump(data)}")
+                try:
+                    dst.sendall(data)
+                except OSError as e:
+                    _log(cid, f"{label} send error: {e}")
+                    break
+                try:
+                    _observe_frame(data, cid, label)
+                except Exception as e:
+                    _log(cid, f"{label} observe error: {e}")
+        finally:
+            stop.set()
+
+    t1 = threading.Thread(target=pump, args=(tls_in, tls_up, "DONGLE→SRV"), daemon=True)
+    t2 = threading.Thread(target=pump, args=(tls_up, tls_in, "SRV→DONGLE"), daemon=True)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+
+def _shuttle_plain(c_in, c_out, cid: int) -> None:
+    stop = threading.Event()
+
+    def pump(src, dst, label):
+        try:
+            while not stop.is_set():
+                try:
+                    data = src.recv(16384)
+                except OSError:
+                    break
+                if not data:
+                    break
+                _log(cid, f"{label} {len(data)}B: {hexdump(data)}")
+                try:
+                    dst.sendall(data)
+                except OSError:
+                    break
+        finally:
+            stop.set()
+
+    t1 = threading.Thread(target=pump, args=(c_in, c_out, "DONGLE→SRV-plain"), daemon=True)
+    t2 = threading.Thread(target=pump, args=(c_out, c_in, "SRV→DONGLE-plain"), daemon=True)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+
 def handle_capture(conn: socket.socket, addr, cid: int, ssl_ctx: ssl.SSLContext) -> None:
     _log(cid, f"OPEN from {addr[0]}:{addr[1]}")
     try:
@@ -450,11 +623,21 @@ def main() -> None:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5280
     bind_addr = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
     mode = os.environ.get("GROTT_SINK_MODE", "discard").strip().lower()
-    handler = handle_capture if mode == "capture" else handle_discard
     ssl_ctx = None
-    if mode == "capture":
+    if mode == "mitm":
+        if not MITM_HOST or not MITM_PORT:
+            print("[localsink] mitm mode requires GROTT_MITM_HOST and GROTT_MITM_PORT", flush=True)
+            sys.exit(2)
         ensure_cert()
         ssl_ctx = make_ssl_context()
+        handler = handle_mitm
+        print(f"[localsink] MITM upstream: {MITM_HOST}:{MITM_PORT}", flush=True)
+    elif mode == "capture":
+        ensure_cert()
+        ssl_ctx = make_ssl_context()
+        handler = handle_capture
+    else:
+        handler = handle_discard
 
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
