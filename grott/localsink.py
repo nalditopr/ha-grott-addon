@@ -85,38 +85,7 @@ HA_SENSORS = [
      "icon": "mdi:counter"},
     {"key": "upload_ts_us", "name": "Upload Timestamp µs",
      "state_class": "measurement", "icon": "mdi:timer-sand"},
-
-    # Candidate sensors — provisional mappings pending day/night verification.
-    # Whichever AC voltage stays near grid + battery voltage drops overnight
-    # + SOC tracks battery state is the correct one.
-    {"key": "candidate_ac_v_a", "name": "AC Voltage cand. A (+63)",
-     "unit": "V", "device_class": "voltage", "state_class": "measurement"},
-    {"key": "candidate_ac_v_b", "name": "AC Voltage cand. B (+110)",
-     "unit": "V", "device_class": "voltage", "state_class": "measurement"},
-    {"key": "candidate_ac_v_c", "name": "AC Voltage cand. C (+132)",
-     "unit": "V", "device_class": "voltage", "state_class": "measurement"},
-    {"key": "candidate_ac_v_d", "name": "AC Voltage cand. D (+216)",
-     "unit": "V", "device_class": "voltage", "state_class": "measurement"},
-    {"key": "candidate_bat_v_a", "name": "Battery V cand. A (+90)",
-     "unit": "V", "device_class": "voltage", "state_class": "measurement"},
-    {"key": "candidate_bat_v_b", "name": "Battery V cand. B (+95)",
-     "unit": "V", "device_class": "voltage", "state_class": "measurement"},
-    {"key": "candidate_bat_v_c", "name": "Battery V cand. C (+122)",
-     "unit": "V", "device_class": "voltage", "state_class": "measurement"},
-    {"key": "candidate_bat_v_d", "name": "Battery V cand. D (+148)",
-     "unit": "V", "device_class": "voltage", "state_class": "measurement"},
-    {"key": "candidate_bat_v_e", "name": "Battery V cand. E (+230)",
-     "unit": "V", "device_class": "voltage", "state_class": "measurement"},
-    {"key": "candidate_bat_v_f", "name": "Battery V cand. F (+232)",
-     "unit": "V", "device_class": "voltage", "state_class": "measurement"},
-    {"key": "candidate_soc_a", "name": "SOC cand. A (+91)",
-     "unit": "%", "device_class": "battery", "state_class": "measurement"},
-    {"key": "candidate_soc_b", "name": "SOC cand. B (+167)",
-     "unit": "%", "device_class": "battery", "state_class": "measurement"},
-    {"key": "candidate_soc_c", "name": "SOC cand. C (+180)",
-     "unit": "%", "device_class": "battery", "state_class": "measurement"},
-    {"key": "candidate_soc_d", "name": "SOC cand. D (+182)",
-     "unit": "%", "device_class": "battery", "state_class": "measurement"},
+    {"key": "inverter_clock", "name": "Inverter Clock", "icon": "mdi:clock-outline"},
 ]
 
 
@@ -302,45 +271,24 @@ def extract_metadata(data: bytes) -> dict:
         meta["upload_seq"] = data[18]
         meta["upload_ts_us"] = struct.unpack(">I", data[34:38])[0]
 
-    # Candidate telemetry fields, anchored at "ULSP05" inside the payload.
-    # Identified by night-time captures showing values consistent with
-    # AC voltage (220-260V) and 16-cell LiFePO4 battery (45-55V). Marked
-    # _candidate_ pending day/night verification — the correct one is
-    # the one that drops slowly overnight + rises with morning sun.
+    # Inverter real-time clock. Verified against capture wall-clock across
+    # 267 night captures: a 6-byte field [HH, 00, MM, 0b, 00, SS] appears
+    # ~232 bytes after the "ULSP05" anchor, where HH/MM/SS are plain bytes
+    # (not BCD). The 0x0b separator confirms alignment; if it's absent the
+    # field has shifted (variable-length upstream) so we skip rather than
+    # emit a wrong time.
     anchor_idx = data.find(b"ULSP05")
     if anchor_idx >= 0:
-        a = anchor_idx + 6  # position right after ULSP05
-        def be16(off, scale=1.0):
-            if a + off + 2 > len(data):
-                return None
-            return struct.unpack(">H", data[a + off:a + off + 2])[0] / scale
-
-        def u8(off):
-            if a + off + 1 > len(data):
-                return None
-            return data[a + off]
-
-        # AC voltage candidates (BE16 / 10 → volts)
-        for off, suffix in [(63, "ac_v_a"), (110, "ac_v_b"),
-                             (132, "ac_v_c"), (216, "ac_v_d")]:
-            v = be16(off, 10)
-            if v is not None:
-                meta[f"candidate_{suffix}"] = v
-
-        # Battery voltage candidates (BE16 / 100 → volts)
-        for off, suffix in [(90, "bat_v_a"), (95, "bat_v_b"),
-                             (122, "bat_v_c"), (148, "bat_v_d"),
-                             (230, "bat_v_e"), (232, "bat_v_f")]:
-            v = be16(off, 100)
-            if v is not None:
-                meta[f"candidate_{suffix}"] = v
-
-        # SOC candidates (BE16, range 0-100)
-        for off, suffix in [(91, "soc_a"), (167, "soc_b"),
-                             (180, "soc_c"), (182, "soc_d")]:
-            v = be16(off, 1)
-            if v is not None:
-                meta[f"candidate_{suffix}"] = int(v)
+        a = anchor_idx + 6
+        # Search a small window for the [HH,00,MM,0b,00,SS] clock signature
+        for off in range(228, 240):
+            if a + off + 6 > len(data):
+                break
+            c = data[a + off:a + off + 6]
+            hh, z1, mm, sep, z2, ss = c
+            if z1 == 0 and sep == 0x0b and z2 == 0 and hh < 24 and mm < 60 and ss < 60:
+                meta["inverter_clock"] = f"{hh:02d}:{mm:02d}:{ss:02d}"
+                break
 
     return meta
 
