@@ -705,12 +705,30 @@ def _probe_injector(tls_in, cid: int, stop: threading.Event, state: dict) -> Non
     """
     import pathlib
     pf = pathlib.Path("/data/probes.txt")
+    dpf = pathlib.Path("/data/probe_delay.txt")
+    spf = pathlib.Path("/data/probes_sent.txt")
     try:
         pathlib.Path("/data/mitm").mkdir(exist_ok=True)
     except OSError:
         pass
+    # Single-shot across reconnects: load already-sent probes so a probe that
+    # causes the dongle to drop/reconnect (e.g. action:quit) isn't resent in a
+    # loop. Clear /data/probes_sent.txt to allow re-sending everything again.
+    try:
+        if spf.exists():
+            state["sent"].update(x.strip() for x in spf.read_text().splitlines() if x.strip())
+    except OSError:
+        pass
     while not stop.is_set():
         try:
+            # Inter-probe spacing so each command's response is cleanly
+            # attributable (default 5s, override via /data/probe_delay.txt).
+            delay = 5.0
+            try:
+                if dpf.exists():
+                    delay = max(0.3, float(dpf.read_text().strip()))
+            except Exception:
+                pass
             if pf.exists():
                 for ln in pf.read_text().splitlines():
                     ln = ln.strip().replace(" ", "")
@@ -725,9 +743,16 @@ def _probe_injector(tls_in, cid: int, stop: threading.Event, state: dict) -> Non
                     try:
                         tls_in.sendall(raw)
                         state["last_ts"] = time.time()
+                        try:
+                            with open(spf, "a") as sf:
+                                sf.write(ln + "\n")
+                        except OSError:
+                            pass
                         _log(cid, f"=== PROBE->DONGLE {len(raw)}B: {raw.hex()} ===")
                     except OSError as e:
                         _log(cid, f"PROBE send failed: {e}")
+                        return
+                    if stop.wait(delay):  # space sends; bail promptly on stop
                         return
         except Exception as e:
             _log(cid, f"probe injector error: {e}")
