@@ -498,6 +498,17 @@ def handle_mitm(conn: socket.socket, addr, cid: int, ssl_ctx: ssl.SSLContext) ->
         except Exception:
             pass
 
+        # Hold the relay open like a real persistent dongle<->cloud session.
+        # The cloud sends 0x2708 keepalives ~40s apart; a short read timeout
+        # closes healthy idle connections and makes the cloud see the device
+        # flap (so the app shows no live data). Use a timeout well above the
+        # keepalive interval so only genuinely dead links get reaped.
+        try:
+            tls_in.settimeout(300)
+            tls_up.settimeout(300)
+        except OSError:
+            pass
+
         _shuttle_tls(tls_in, tls_up, cid)
     except OSError as e:
         _log(cid, f"socket error: {e}")
