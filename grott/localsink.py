@@ -690,11 +690,57 @@ def handle_mitm(conn: socket.socket, addr, cid: int, ssl_ctx: ssl.SSLContext) ->
                 pass
 
 
+def _probe_injector(tls_in, cid: int, stop: threading.Event, state: dict) -> None:
+    """Reverse-engineer the cloud->dongle command channel (network-only).
+
+    Reads candidate command frames from ``/data/probes.txt`` — one hex string
+    per line, ``#`` comments ignored — and sends each (once, when first seen)
+    to the dongle over the TLS channel we control, impersonating the server.
+    The pump logs the dongle's reaction; a successful read-register command
+    should elicit a new response message type and/or change the next 0x260f.
+
+    Editable live over SSH (no rebuild). Fail-safe: any error is logged and
+    swallowed so it can never disturb the working MITM/telemetry path.
+    Intended for READ (Modbus FC 03/04) experimentation only — never writes.
+    """
+    import pathlib
+    pf = pathlib.Path("/data/probes.txt")
+    try:
+        pathlib.Path("/data/mitm").mkdir(exist_ok=True)
+    except OSError:
+        pass
+    while not stop.is_set():
+        try:
+            if pf.exists():
+                for ln in pf.read_text().splitlines():
+                    ln = ln.strip().replace(" ", "")
+                    if not ln or ln.startswith("#") or ln in state["sent"]:
+                        continue
+                    state["sent"].add(ln)
+                    try:
+                        raw = bytes.fromhex(ln)
+                    except ValueError:
+                        _log(cid, f"PROBE skip (bad hex): {ln[:48]}")
+                        continue
+                    try:
+                        tls_in.sendall(raw)
+                        state["last_ts"] = time.time()
+                        _log(cid, f"=== PROBE->DONGLE {len(raw)}B: {raw.hex()} ===")
+                    except OSError as e:
+                        _log(cid, f"PROBE send failed: {e}")
+                        return
+        except Exception as e:
+            _log(cid, f"probe injector error: {e}")
+        stop.wait(3.0)
+
+
 def _shuttle_tls(tls_in, tls_up, cid: int) -> None:
     stop = threading.Event()
     # Per-connection-per-direction buffer of EVERY byte seen.
     # Written out as one file per direction on connection close.
     buffers = {"DONGLE→SRV": bytearray(), "SRV→DONGLE": bytearray()}
+    # Shared state for the probe injector (command-channel RE).
+    probe_state = {"last_ts": 0.0, "sent": set()}
 
     def pump(src, dst, label):
         try:
@@ -711,6 +757,16 @@ def _shuttle_tls(tls_in, tls_up, cid: int) -> None:
                 preview = data[:200]
                 more = "" if len(data) <= 200 else f" ...+{len(data)-200}B"
                 _log(cid, f"{label} {len(data)}B: {hexdump(preview)}{more}")
+                # Flag dongle traffic arriving just after a probe — likely a
+                # reaction. Persist it so command-channel hits are obvious.
+                if label == "DONGLE→SRV" and (time.time() - probe_state["last_ts"]) < 20:
+                    _log(cid, f"[POST-PROBE] DONGLE→SRV {len(data)}B: {hexdump(preview)}{more}")
+                    try:
+                        with open("/data/mitm/probe_responses.log", "a") as pf:
+                            pf.write(f"{datetime.datetime.now().isoformat()} cid{cid} "
+                                     f"{data.hex()}\n")
+                    except OSError:
+                        pass
                 try:
                     dst.sendall(data)
                 except OSError as e:
@@ -726,7 +782,8 @@ def _shuttle_tls(tls_in, tls_up, cid: int) -> None:
 
     t1 = threading.Thread(target=pump, args=(tls_in, tls_up, "DONGLE→SRV"), daemon=True)
     t2 = threading.Thread(target=pump, args=(tls_up, tls_in, "SRV→DONGLE"), daemon=True)
-    t1.start(); t2.start()
+    t3 = threading.Thread(target=_probe_injector, args=(tls_in, cid, stop, probe_state), daemon=True)
+    t1.start(); t2.start(); t3.start()
     t1.join(); t2.join()
 
     # Persist full transcripts for offline analysis
