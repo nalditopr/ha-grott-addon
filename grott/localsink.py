@@ -81,6 +81,10 @@ HA_SENSORS = [
      "icon": "mdi:clock-digital"},
     {"key": "frame_size", "name": "Last Frame Size", "unit": "B",
      "state_class": "measurement", "icon": "mdi:format-size"},
+    {"key": "upload_seq", "name": "Upload Sequence", "state_class": "measurement",
+     "icon": "mdi:counter"},
+    {"key": "upload_ts_us", "name": "Upload Timestamp µs",
+     "state_class": "measurement", "icon": "mdi:timer-sand"},
 ]
 
 
@@ -253,6 +257,15 @@ def extract_metadata(data: bytes) -> dict:
     mac_match = re.search(r'mac\s+([0-9A-Fa-f:]+)', text)
     if mac_match:
         meta["mac"] = mac_match.group(1)
+
+    # Binary fields at known offsets inside the 0x260f payload.
+    # data starts with the 2-byte 0x260f type marker, then the payload.
+    # Verified by diffing 13 captures:
+    #   data[18]    = upload sequence counter (1 byte, increments per upload)
+    #   data[34:38] = upload microsecond timestamp delta (4-byte BE)
+    if len(data) >= 38 and data[:2] == b"\x26\x0f":
+        meta["upload_seq"] = data[18]
+        meta["upload_ts_us"] = struct.unpack(">I", data[34:38])[0]
 
     return meta
 
