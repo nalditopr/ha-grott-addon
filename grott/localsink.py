@@ -88,6 +88,22 @@ HA_SENSORS = [
     {"key": "inverter_clock", "name": "Inverter Clock", "icon": "mdi:clock-outline"},
 ]
 
+# Live telemetry sensors, decoded from the 2nd (live) 0x260f message.
+# These read from the `telemetry` subtopic (kept separate from `status` so
+# metadata-only frames don't blank them out). See decode_telemetry().
+HA_TELEMETRY_SENSORS = [
+    {"key": "pv_power", "name": "PV Power", "unit": "W", "topic": "telemetry",
+     "device_class": "power", "state_class": "measurement"},
+    {"key": "pv1_voltage", "name": "PV1 Voltage", "unit": "V", "topic": "telemetry",
+     "device_class": "voltage", "state_class": "measurement"},
+    {"key": "pv1_current", "name": "PV1 Current", "unit": "A", "topic": "telemetry",
+     "device_class": "current", "state_class": "measurement"},
+    {"key": "pv1_power", "name": "PV1 Power", "unit": "W", "topic": "telemetry",
+     "device_class": "power", "state_class": "measurement"},
+    {"key": "pv2_voltage", "name": "PV2 Voltage", "unit": "V", "topic": "telemetry",
+     "device_class": "voltage", "state_class": "measurement"},
+]
+
 
 def _ts() -> str:
     return datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -171,10 +187,12 @@ def ha_publish_discovery(meta: dict, cid: int) -> None:
     if "firmware" in meta:
         device["sw_version"] = meta["firmware"]
 
-    state_topic = f"{MQTT_TOPIC}/status"
     sent = 0
-    for s in HA_SENSORS:
+    for s in HA_SENSORS + HA_TELEMETRY_SENSORS:
         key = s["key"]
+        # Sensor reads from its own subtopic ("status" for metadata,
+        # "telemetry" for live PV fields).
+        state_topic = f"{MQTT_TOPIC}/{s.get('topic', 'status')}"
         # No `| default('')` — HA rejects voltage/battery sensors whose state
         # is empty string. Letting Jinja return Undefined makes the entity
         # show 'unavailable' instead, which HA accepts.
@@ -293,6 +311,73 @@ def extract_metadata(data: bytes) -> dict:
     return meta
 
 
+def decode_telemetry(data: bytes) -> dict:
+    """Decode live PV telemetry from the 2nd (live) 0x260f message.
+
+    The live message starts with the marker ``26 0f 0b "gw"`` and a 40-byte
+    header ending in ``0x81a4``; the body that follows is a Modbus-register-
+    ordered block (Growatt ``divideBy10`` scaling). Field offsets were
+    reverse-engineered and validated against the inverter's physical display
+    plus a P = V*I self-consistency check across many captures (2026-05-20):
+
+        body[5]  BE32  Ppv  total PV power    /10 -> W
+        body[9]  BE16  Vpv1 string-1 voltage  /10 -> V
+        body[11] BE16  Ipv1 string-1 current  /10 -> A
+        body[13] BE32  Ppv1 string-1 power    /10 -> W   (== Vpv1*Ipv1)
+        body[17] BE16  Vpv2 string-2 voltage  /10 -> V
+
+    The live body reliably begins ``00 00 7d 00 01``. A big frame carries two
+    0x260f messages (config snapshot + live batch) — we take the LAST marker.
+    Returns {} if the message/anchor can't be located, the body signature is
+    wrong, values fall outside sane ranges, or the P=V*I check fails (any of
+    which means the variable-length front shifted alignment — better to emit
+    nothing than a wrong reading).
+    """
+    sig = b"\x26\x0f\x0b\x67\x77"  # 26 0f 0b "gw"
+    idx = data.rfind(sig)
+    if idx < 0:
+        return {}
+    a = data.find(b"\x81\xa4", idx + 30, idx + 64)
+    if a < 0:
+        return {}
+    body = data[a + 2:]
+    # Live-body signature guard: distinguishes the live batch from the
+    # config-snapshot 0x260f (which shares the gw-uploader marker).
+    if len(body) < 19 or body[0:3] != b"\x00\x00\x7d":
+        return {}
+    try:
+        ppv = struct.unpack_from(">I", body, 5)[0] / 10.0
+        vpv1 = struct.unpack_from(">H", body, 9)[0] / 10.0
+        ipv1 = struct.unpack_from(">H", body, 11)[0] / 10.0
+        ppv1 = struct.unpack_from(">I", body, 13)[0] / 10.0
+        vpv2 = struct.unpack_from(">H", body, 17)[0] / 10.0
+    except struct.error:
+        return {}
+    # Sanity ranges (reject drifted alignment rather than publish garbage)
+    if not (0 <= ppv <= 60000 and 0 <= vpv1 <= 1000 and 0 <= ipv1 <= 100
+            and 0 <= ppv1 <= 60000 and 0 <= vpv2 <= 1000):
+        return {}
+    # P = V*I cross-check on string 1 (the proof the offsets are right)
+    vi = vpv1 * ipv1
+    if ppv1 > 50 and abs(vi - ppv1) > max(60, 0.30 * ppv1):
+        return {}
+    return {
+        "pv_power": round(ppv, 1),
+        "pv1_voltage": round(vpv1, 1),
+        "pv1_current": round(ipv1, 1),
+        "pv1_power": round(ppv1, 1),
+        "pv2_voltage": round(vpv2, 1),
+    }
+
+
+def publish_telemetry(data: bytes, cid: int) -> None:
+    """Decode live PV telemetry and publish to the `telemetry` subtopic."""
+    tele = decode_telemetry(data)
+    if tele:
+        mqtt_publish("telemetry", tele, cid)
+        _log(cid, f"telemetry: {tele!r}")
+
+
 def log_frame(data: bytes, meta: dict, cid: int) -> None:
     """Persist frame hex + metadata to /data for offline analysis."""
     import pathlib, glob
@@ -353,6 +438,8 @@ def build_reply(data: bytes, cid: int) -> bytes:
             mqtt_publish("status", meta, cid)
             _log(cid, f"metadata: {meta!r}")
             ha_publish_discovery(meta, cid)
+        # Decode + publish live PV telemetry from the live 0x260f message
+        publish_telemetry(data, cid)
         # Also publish raw hex for external decoders
         mqtt_publish("raw_hex", {"type": "0x260f", "hex": data.hex()}, cid)
         # Persist to disk for time-series comparison / RE
@@ -432,6 +519,7 @@ def _observe_frame(data: bytes, cid: int, direction: str) -> None:
             meta["frame_size"] = len(data)
             mqtt_publish("status", meta, cid)
             ha_publish_discovery(meta, cid)
+        publish_telemetry(data, cid)
         mqtt_publish("raw_hex", {"type": "0x260f", "hex": data.hex()}, cid)
         log_frame(data, meta or {}, cid)
 
