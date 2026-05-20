@@ -206,10 +206,13 @@ def ha_publish_discovery(meta: dict, cid: int) -> None:
     sent = 0
     for s in HA_SENSORS:
         key = s["key"]
+        # No `| default('')` — HA rejects voltage/battery sensors whose state
+        # is empty string. Letting Jinja return Undefined makes the entity
+        # show 'unavailable' instead, which HA accepts.
         cfg = {
             "name": s["name"],
             "state_topic": state_topic,
-            "value_template": "{{ value_json." + key + " | default('') }}",
+            "value_template": "{{ value_json." + key + " }}",
             "unique_id": f"{device_id}_{key}",
             "object_id": f"{device_id}_{key}",
             "device": device,
