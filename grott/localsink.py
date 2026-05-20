@@ -520,14 +520,41 @@ def _shuttle_tls(tls_in, tls_up, cid: int) -> None:
         d = pathlib.Path("/data/mitm")
         d.mkdir(exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        unix_ts = int(time.time())
         for label, buf in buffers.items():
             if not buf:
                 continue
             side = "dongle_to_srv" if label.startswith("DONGLE") else "srv_to_dongle"
             (d / f"{ts}_conn{cid}_{side}.bin").write_bytes(bytes(buf))
-        _log(cid, f"transcripts saved — D→S {len(buffers['DONGLE→SRV'])}B, S→D {len(buffers['SRV→DONGLE'])}B")
-        # Rotate: keep last 50 connections (100 files)
-        files = sorted(d.glob("*.bin"), key=lambda p: p.stat().st_mtime)
+
+        # Also append to a rolling chronological log (NDJSON) for time-series
+        # analysis. One line per connection. Hex only — no decoding here.
+        log_path = d / "transcripts.ndjson"
+        d_buf = bytes(buffers.get("DONGLE→SRV", b""))
+        s_buf = bytes(buffers.get("SRV→DONGLE", b""))
+        try:
+            with open(log_path, "a") as f:
+                f.write(json.dumps({
+                    "ts": unix_ts,
+                    "iso": datetime.datetime.now().isoformat(),
+                    "cid": cid,
+                    "d_to_s_hex": d_buf.hex(),
+                    "s_to_d_hex": s_buf.hex(),
+                    "d_to_s_len": len(d_buf),
+                    "s_to_d_len": len(s_buf),
+                }) + "\n")
+            # Rotate ndjson if it gets too big (>50MB)
+            try:
+                if log_path.stat().st_size > 50 * 1024 * 1024:
+                    log_path.rename(d / f"transcripts_{unix_ts}.ndjson.bak")
+            except OSError:
+                pass
+        except OSError as e:
+            _log(cid, f"ndjson append failed: {e}")
+
+        _log(cid, f"transcripts saved — D→S {len(d_buf)}B, S→D {len(s_buf)}B")
+        # Rotate per-conn bins: keep last 50 connections (100 files)
+        files = sorted(d.glob("*_conn*.bin"), key=lambda p: p.stat().st_mtime)
         for old in files[:-100]:
             old.unlink(missing_ok=True)
     except OSError as e:
