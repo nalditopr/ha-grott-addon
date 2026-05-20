@@ -416,14 +416,22 @@ def handle_mitm(conn: socket.socket, addr, cid: int, ssl_ctx: ssl.SSLContext) ->
             _log(cid, "EOF before any data")
             return
         if head != b"\x16":
-            _log(cid, f"first byte 0x{head.hex()} — not TLS, falling back to plain pass-through")
-            # Plain TCP pass-through to upstream (no TLS either direction)
+            _log(cid, f"first byte 0x{head.hex()} — plain (probe), echoing locally")
+            # Dongle sends a "hello" probe before opening TLS. The real cloud
+            # doesn't respond to it — it's purely a reachability check the
+            # dongle does locally. Echo back so the dongle considers us reachable.
             try:
-                up_raw = socket.create_connection((MITM_HOST, MITM_PORT), timeout=10)
-            except OSError as e:
-                _log(cid, f"upstream connect failed: {e}")
-                return
-            _shuttle_plain(conn, up_raw, cid)
+                while True:
+                    data = conn.recv(4096)
+                    if not data:
+                        break
+                    _log(cid, f"plain RX {len(data)}B: {hexdump(data)}")
+                    try:
+                        conn.sendall(data)
+                    except OSError:
+                        break
+            except OSError:
+                pass
             return
 
         # Accept dongle TLS
