@@ -370,16 +370,17 @@ def extract_metadata(data: bytes) -> dict:
 
 
 # LiFePO4 pack SOC vs RESTING voltage (48 V / 16S), from the owner's reference
-# chart. Uses the "rest" column (we read voltage mostly at night when the pack
-# is resting/discharging, not under charge): 0% = 40.0 V, 100% rest = 54.4 V.
-# Note the steep knees at the ends and the very flat plateau 30-90% (51.5-53.6 V)
-# characteristic of LiFePO4 — small voltage changes there mean large SOC swings.
-# The inverter has no separate SOC register — it derives state-of-charge from
-# pack voltage, which is why SOC never appeared in the byte stream. Piecewise-
-# linear; voltage under charge reads high (e.g. 58.4 V at 100% charging) so it
-# clamps to 100. Tune breakpoints against the display if needed.
+# chart for 10-100%, but with the **0% anchor set from OUR measured data**: over
+# two full nights the pack discharges to a sustained ~45.1-45.2 V floor (transient
+# load-sag to 43 V) as it hits the 46.0 V LBCO and flips the house to grid — so
+# 45.0 V is this pack's true empty, not the chart's generic 40.0 V. Above 48 V the
+# owner's "rest" column is unchanged (100% rest = 54.4 V). Note the very flat
+# plateau 30-90% (51.5-53.6 V) — small voltage changes there mean large SOC swings.
+# The inverter has no SOC register — it derives SOC from pack voltage, which is why
+# SOC never appeared in the byte stream. Piecewise-linear; voltage under charge
+# reads high (up to 58.4 V at 100% charging) so it clamps to 100.
 LIFEPO4_SOC_CURVE = [
-    (40.0, 0), (48.0, 10), (51.2, 20), (51.5, 30), (52.0, 40), (52.2, 50),
+    (45.0, 0), (48.0, 10), (51.2, 20), (51.5, 30), (52.0, 40), (52.2, 50),
     (52.3, 60), (52.8, 70), (53.1, 80), (53.6, 90), (54.4, 100),
 ]
 
@@ -486,15 +487,17 @@ def decode_telemetry(data: bytes) -> dict:
     # bytes apart with the pack voltage (BATT, /10 V) between them. It used to be
     # located via a `00 07 b8` prefix, but that 3rd byte drifts (b8/b9/…) and the
     # hard search silently missed whole nights. Instead match the pattern itself:
-    # equal flanks, a plausible 45.5-54.5 V pack value (LBCO 46 → Float 52, plus
-    # absorption/equalization headroom), and the flank sitting ~9-12 V above the
-    # pack (raw diff 85-120 — the genuine block; rejects coincidental matches).
+    # equal flanks, a plausible 44.0-54.5 V pack value, and the flank sitting
+    # ~9-12 V above the pack (raw diff 85-120 — the genuine block; rejects
+    # coincidental matches). Lower bound is 44.0 V (was 45.5): the pack actually
+    # discharges to a sustained ~45.1 V floor with load-sag below it, so 45.5 was
+    # silently CLIPPING the true empty state every night — now it's visible.
     for i in range(0, len(body) - 5):
         f1 = struct.unpack_from(">H", body, i)[0]
         if f1 != struct.unpack_from(">H", body, i + 4)[0]:
             continue
         batt_raw = struct.unpack_from(">H", body, i + 2)[0]
-        if not (455 <= batt_raw <= 545 and 85 <= (f1 - batt_raw) <= 120):
+        if not (440 <= batt_raw <= 545 and 85 <= (f1 - batt_raw) <= 120):
             continue
         batt = batt_raw / 10.0
         result["battery_voltage"] = round(batt, 1)
