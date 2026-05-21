@@ -114,6 +114,8 @@ HA_TELEMETRY_SENSORS = [
      "device_class": "voltage", "state_class": "measurement"},
     {"key": "battery_soc", "name": "Battery SOC", "unit": "%", "topic": "telemetry",
      "device_class": "battery", "state_class": "measurement"},
+    {"key": "bus_voltage", "name": "Bus Voltage", "unit": "V", "topic": "telemetry",
+     "device_class": "voltage", "state_class": "measurement"},
 ]
 
 
@@ -475,6 +477,9 @@ def decode_telemetry(data: bytes) -> dict:
         result["battery_voltage"] = round(batt, 1)
         # SOC is voltage-derived (no dedicated register on this inverter).
         result["battery_soc"] = soc_from_voltage(batt)
+        # The matching flanks are the DC Bus voltage (GroBro: SPF reg19, /10 V),
+        # sitting ~9-12 V above the pack. Expose it as a bonus sensor.
+        result["bus_voltage"] = round(f1 / 10.0, 1)
         break
 
     return result
