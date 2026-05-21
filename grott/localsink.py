@@ -129,6 +129,14 @@ HA_TELEMETRY_SENSORS = [
     # whole-house-vs-circuit identity pending live confirmation vs the display.
     {"key": "ac_output", "name": "AC Output / Load (exp)", "unit": "W", "topic": "telemetry",
      "device_class": "power", "state_class": "measurement"},
+    # DERIVED from the AC-bus energy balance (PV - load); no battery-power
+    # register exists in the stream. Accurate when the battery is the only
+    # buffer (overnight discharge, midday charge); misattributes grid import/
+    # export when those flow. See decode_telemetry for the full caveat.
+    {"key": "battery_charge_power", "name": "Battery Charge Power (derived)", "unit": "W",
+     "topic": "telemetry", "device_class": "power", "state_class": "measurement"},
+    {"key": "battery_discharge_power", "name": "Battery Discharge Power (derived)", "unit": "W",
+     "topic": "telemetry", "device_class": "power", "state_class": "measurement"},
 ]
 
 
@@ -529,6 +537,24 @@ def decode_telemetry(data: bytes) -> dict:
         ac = struct.unpack_from(">H", body, fac_off - 2)[0] / 10.0
         if 100 <= ac <= 8000:
             result["ac_output"] = round(ac)
+
+    # --- Battery charge / discharge power (DERIVED from energy balance) -----
+    # No battery-power register survives in the compacted stream (exhaustive
+    # offset / energy-balance / sign-flip searches over many sessions found
+    # only config constants). But with PV and AC load both decoded it falls out
+    # of the AC-bus balance:  net_to_battery = PV - load  (+ charging / - discharging).
+    # Validated: overnight (PV~0) discharge tracks the house load; the 09:35
+    # display reading (PV 2.9k, house 7.3k -> 4.4k discharge) matched the panel's
+    # 4.8 kW within conversion losses. Grid is intentionally NOT subtracted: the
+    # experimental grid_power is unreliable at dawn and would inject worse error.
+    # LIMITATIONS (hence "derived"): during grid IMPORT (dawn) the deficit shows
+    # as a small phantom discharge (battery is empty then); during EXPORT (full
+    # battery, high PV midday) surplus shows as phantom charge. Only emitted when
+    # both pv_power and ac_output are present.
+    if "pv_power" in result and "ac_output" in result:
+        net = result["pv_power"] - result["ac_output"]   # + = into battery
+        result["battery_charge_power"] = round(max(0, net))
+        result["battery_discharge_power"] = round(max(0, -net))
 
     return result
 
