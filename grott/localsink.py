@@ -121,6 +121,14 @@ HA_TELEMETRY_SENSORS = [
     # of the day. Scale tentative. Here to validate against the inverter display.
     {"key": "grid_power", "name": "Grid Power (exp)", "unit": "W", "topic": "telemetry",
      "device_class": "power", "state_class": "measurement"},
+    # EXPERIMENTAL — AC output / house load. The BE16 sitting immediately before
+    # the Fac/Vac grid block (Growatt's AC-output register slot), /10 W. On
+    # ~150 frames it shows a stable ~1.1 kW baseline, smooth (median step 129 W),
+    # independent of PV (corr +0.08) with appliance spikes to ~3.4 kW — a house-
+    # load signature. Published only on clean (lead-token 0x07) frames. Scale and
+    # whole-house-vs-circuit identity pending live confirmation vs the display.
+    {"key": "ac_output", "name": "AC Output / Load (exp)", "unit": "W", "topic": "telemetry",
+     "device_class": "power", "state_class": "measurement"},
 ]
 
 
@@ -455,6 +463,7 @@ def decode_telemetry(data: bytes) -> dict:
     # Grid frequency is a near-constant ~60.00 Hz (/100), a perfect anchor: scan
     # past the PV block for a value in 59-61 Hz, then grid voltage sits 2 bytes
     # after it (/10 V). Validated every frame: ~60.0 Hz, 121-125 V (PR 120V).
+    fac_off = None
     for i in range(30, len(body) - 3):
         f = struct.unpack_from(">H", body, i)[0]
         if 5900 <= f <= 6100:
@@ -462,6 +471,7 @@ def decode_telemetry(data: bytes) -> dict:
             if 900 <= vac <= 2700:  # 90-270 V
                 result["grid_frequency"] = round(f / 100.0, 2)
                 result["grid_voltage"] = round(vac / 10.0, 1)
+                fac_off = i
                 break
 
     # --- Battery voltage + SOC (sandwich pattern, anchor-byte-agnostic) ---
@@ -507,6 +517,18 @@ def decode_telemetry(data: bytes) -> dict:
         if -8000 <= gw <= -50:               # plausible import, negative
             result["grid_power"] = gw        # W, negative = import
             break
+
+    # --- AC output / house load (EXPERIMENTAL / candidate) -----------------
+    # The BE16 immediately before Fac is the slot Growatt uses for AC output
+    # power. Across ~150 frames it reads a stable ~1.1 kW baseline, smooth, and
+    # independent of PV (corr +0.08) with appliance spikes — a house-load
+    # fingerprint. The compaction token just before it must be 0x07: on 0x0f/
+    # 0x13 frames an extra field is inserted and `fac_off-2` is a DIFFERENT
+    # register, so we skip those to avoid publishing positional noise. /10 W.
+    if fac_off is not None and fac_off >= 3 and body[fac_off - 3] == 0x07:
+        ac = struct.unpack_from(">H", body, fac_off - 2)[0] / 10.0
+        if 100 <= ac <= 8000:
+            result["ac_output"] = round(ac)
 
     return result
 
