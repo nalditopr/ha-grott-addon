@@ -116,11 +116,10 @@ HA_TELEMETRY_SENSORS = [
      "device_class": "battery", "state_class": "measurement"},
     {"key": "bus_voltage", "name": "Bus Voltage", "unit": "V", "topic": "telemetry",
      "device_class": "voltage", "state_class": "measurement"},
-    # EXPERIMENTAL — candidate grid power (negative = importing). Only published
-    # when the compacted grid record is present (system importing); absent most
-    # of the day. Scale tentative. Here to validate against the inverter display.
-    {"key": "grid_power", "name": "Grid Power (exp)", "unit": "W", "topic": "telemetry",
-     "device_class": "power", "state_class": "measurement"},
+    # NOTE: a "grid power" sensor used to live here (the 00ac record). REMOVED in
+    # v0.8.12 — this is an OFF-GRID system (no grid connection), so there is no
+    # import/export to report; the 00ac value was a non-grid quantity and only
+    # misled. Off-grid also means the AC-bus balance is exactly PV = load + battery.
     # EXPERIMENTAL — AC output / house load. The BE16 sitting immediately before
     # the Fac/Vac grid block (Growatt's AC-output register slot), /10 W. On
     # ~150 frames it shows a stable ~1.1 kW baseline, smooth (median step 129 W),
@@ -130,9 +129,9 @@ HA_TELEMETRY_SENSORS = [
     {"key": "ac_output", "name": "AC Output / Load (exp)", "unit": "W", "topic": "telemetry",
      "device_class": "power", "state_class": "measurement"},
     # DERIVED from the AC-bus energy balance (PV - load); no battery-power
-    # register exists in the stream. Accurate when the battery is the only
-    # buffer (overnight discharge, midday charge); misattributes grid import/
-    # export when those flow. See decode_telemetry for the full caveat.
+    # register exists in the stream. This is an OFF-GRID system (no grid), so the
+    # balance is EXACT: every watt is PV, load, or battery — battery = PV - load
+    # (within inverter conversion losses). + = charging, - = discharging.
     {"key": "battery_charge_power", "name": "Battery Charge Power (derived)", "unit": "W",
      "topic": "telemetry", "device_class": "power", "state_class": "measurement"},
     {"key": "battery_discharge_power", "name": "Battery Discharge Power (derived)", "unit": "W",
@@ -149,6 +148,8 @@ STALE_DISCOVERY_KEYS = [
     "candidate_bat_v_a", "candidate_bat_v_b", "candidate_bat_v_c",
     "candidate_bat_v_d", "candidate_bat_v_e", "candidate_bat_v_f",
     "candidate_soc_a", "candidate_soc_b", "candidate_soc_c", "candidate_soc_d",
+    # grid_power removed in v0.8.12 — off-grid system has no grid import/export.
+    "grid_power",
 ]
 
 
@@ -515,25 +516,8 @@ def decode_telemetry(data: bytes) -> dict:
         result["bus_voltage"] = round(f1 / 10.0, 1)
         break
 
-    # --- Grid power (EXPERIMENTAL / candidate) ------------------------------
-    # The tail is a SPARSE record stream: zero-valued fields are omitted, so
-    # offsets drift through the day (like IPv6 `::` zero-elision). One record
-    # `<skip> AC <signed BE16>` shows up only while the system IMPORTS from the
-    # grid — early morning, battery empty, PV < house load. Its value ramps from
-    # a few kW toward zero as PV climbs, then the record vanishes entirely once
-    # grid ~0 (e.g. 5/20 09:47 grid 0.2 kW -> record absent). Seen as `00 ac`
-    # and, after earlier records collapse, `05 ac`. Read signed BE16 as watts,
-    # negative = importing. NOT yet confirmed and absent most of the day, so we
-    # publish only when it's cleanly present — letting it be validated live
-    # against the inverter's grid-power readout. Scale is tentative (the value's
-    # low byte is a structural 0x20 tag). See compaction vocabulary census.
-    for i in range(200, len(body) - 3):
-        if body[i + 1] != 0xAC or body[i] >= 0x10:
-            continue
-        gw = struct.unpack_from(">h", body, i + 2)[0]
-        if -8000 <= gw <= -50:               # plausible import, negative
-            result["grid_power"] = gw        # W, negative = import
-            break
+    # NOTE: grid-power decode removed in v0.8.12 — this is an OFF-GRID system, so
+    # there is no grid import/export. The 00ac record it used was a non-grid value.
 
     # --- AC output / house load (EXPERIMENTAL / candidate) -----------------
     # The BE16 immediately before Fac is the slot Growatt uses for AC output
@@ -549,17 +533,14 @@ def decode_telemetry(data: bytes) -> dict:
 
     # --- Battery charge / discharge power (DERIVED from energy balance) -----
     # No battery-power register survives in the compacted stream (exhaustive
-    # offset / energy-balance / sign-flip searches over many sessions found
-    # only config constants). But with PV and AC load both decoded it falls out
-    # of the AC-bus balance:  net_to_battery = PV - load  (+ charging / - discharging).
-    # Validated: overnight (PV~0) discharge tracks the house load; the 09:35
-    # display reading (PV 2.9k, house 7.3k -> 4.4k discharge) matched the panel's
-    # 4.8 kW within conversion losses. Grid is intentionally NOT subtracted: the
-    # experimental grid_power is unreliable at dawn and would inject worse error.
-    # LIMITATIONS (hence "derived"): during grid IMPORT (dawn) the deficit shows
-    # as a small phantom discharge (battery is empty then); during EXPORT (full
-    # battery, high PV midday) surplus shows as phantom charge. Only emitted when
-    # both pv_power and ac_output are present.
+    # searches found only config constants). But this is an OFF-GRID system, so
+    # the AC-bus balance is EXACT — every watt is PV, load, or battery:
+    #     net_to_battery = PV - load     (+ charging / - discharging)
+    # With no grid term there is no import/export to misattribute. Validated:
+    # overnight (PV~0) discharge tracks the house load; the 09:35 display reading
+    # (PV 2.9k, house 7.3k -> 4.4k discharge) matched the panel's 4.8 kW within
+    # inverter conversion losses (the only remaining error term). Emitted only
+    # when both pv_power and ac_output are present.
     if "pv_power" in result and "ac_output" in result:
         net = result["pv_power"] - result["ac_output"]   # + = into battery
         result["battery_charge_power"] = round(max(0, net))
