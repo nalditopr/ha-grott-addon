@@ -1,5 +1,5 @@
 name: Grott
-version: "0.8.2"
+version: "0.8.3"
 slug: grott
 description: Local proxy + MQTT bridge for Growatt solar inverters
 url: https://github.com/nalditopr/ha-grott-addon/tree/main/grott
