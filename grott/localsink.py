@@ -482,29 +482,36 @@ def decode_telemetry(data: bytes) -> dict:
                 fac_off = i
                 break
 
-    # --- Battery voltage + SOC (sandwich pattern, anchor-byte-agnostic) ---
-    # The battery block is a sandwich `F1 | BATT | F1`: two EQUAL BE16 flanks 4
-    # bytes apart with the pack voltage (BATT, /10 V) between them. It used to be
-    # located via a `00 07 b8` prefix, but that 3rd byte drifts (b8/b9/…) and the
-    # hard search silently missed whole nights. Instead match the pattern itself:
-    # equal flanks, a plausible 44.0-54.5 V pack value, and the flank sitting
-    # ~9-12 V above the pack (raw diff 85-120 — the genuine block; rejects
-    # coincidental matches). Lower bound is 44.0 V (was 45.5): the pack actually
-    # discharges to a sustained ~45.1 V floor with load-sag below it, so 45.5 was
-    # silently CLIPPING the true empty state every night — now it's visible.
-    for i in range(0, len(body) - 5):
-        f1 = struct.unpack_from(">H", body, i)[0]
-        if f1 != struct.unpack_from(">H", body, i + 4)[0]:
+    # --- Battery voltage + SOC (anchored sandwich, day + night) ---
+    # The battery block is `00 07 [bX] [yy] | F1 | BATT | F1` — a marker `00 07`
+    # then a byte ~0xB5-0xC5, one more byte, then a sandwich (two EQUAL BE16 flanks
+    # 4 bytes apart with the pack voltage BATT, /10 V, between them). The flanks are
+    # the DC bus (GroBro SPF reg19). CRITICAL: the bus-pack gap is ~10 V at night
+    # (discharge) but shrinks to ~1-5 V under charge — the old "gap 85-120" guard
+    # was NIGHT-ONLY and silently dropped the entire daytime CHARGING curve (the
+    # pack climbs to ~52-53 V midday). Anchoring on `00 07 [bX]` + a wide gap
+    # (raw 5-160) recovers ~89% of frames day and night with a smooth curve and
+    # rejects the coincidental sandwiches the bare-pattern search used to hit.
+    s = 0
+    while True:
+        k = body.find(b"\x00\x07", s)
+        if k < 0:
+            break
+        s = k + 1
+        if k + 10 > len(body) or not (0xB5 <= body[k + 2] <= 0xC5):
             continue
-        batt_raw = struct.unpack_from(">H", body, i + 2)[0]
-        if not (440 <= batt_raw <= 545 and 85 <= (f1 - batt_raw) <= 120):
+        f1 = struct.unpack_from(">H", body, k + 4)[0]
+        f2 = struct.unpack_from(">H", body, k + 8)[0]
+        batt_raw = struct.unpack_from(">H", body, k + 6)[0]
+        if not (f1 == f2 and 420 <= batt_raw <= 560 and 5 <= (f1 - batt_raw) <= 160):
             continue
         batt = batt_raw / 10.0
         result["battery_voltage"] = round(batt, 1)
-        # SOC is voltage-derived (no dedicated register on this inverter).
+        # SOC is voltage-derived (no dedicated register on this inverter). NOTE:
+        # the curve is a RESTING curve, so SOC reads a bit high during active
+        # charge (pack voltage is elevated above its rest value while charging).
         result["battery_soc"] = soc_from_voltage(batt)
-        # The matching flanks are the DC Bus voltage (GroBro: SPF reg19, /10 V),
-        # sitting ~9-12 V above the pack. Expose it as a bonus sensor.
+        # The matching flanks are the DC Bus voltage (GroBro: SPF reg19, /10 V).
         result["bus_voltage"] = round(f1 / 10.0, 1)
         break
 
