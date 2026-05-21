@@ -116,6 +116,11 @@ HA_TELEMETRY_SENSORS = [
      "device_class": "battery", "state_class": "measurement"},
     {"key": "bus_voltage", "name": "Bus Voltage", "unit": "V", "topic": "telemetry",
      "device_class": "voltage", "state_class": "measurement"},
+    # EXPERIMENTAL — candidate grid power (negative = importing). Only published
+    # when the compacted grid record is present (system importing); absent most
+    # of the day. Scale tentative. Here to validate against the inverter display.
+    {"key": "grid_power", "name": "Grid Power (exp)", "unit": "W", "topic": "telemetry",
+     "device_class": "power", "state_class": "measurement"},
 ]
 
 
@@ -482,6 +487,26 @@ def decode_telemetry(data: bytes) -> dict:
         # sitting ~9-12 V above the pack. Expose it as a bonus sensor.
         result["bus_voltage"] = round(f1 / 10.0, 1)
         break
+
+    # --- Grid power (EXPERIMENTAL / candidate) ------------------------------
+    # The tail is a SPARSE record stream: zero-valued fields are omitted, so
+    # offsets drift through the day (like IPv6 `::` zero-elision). One record
+    # `<skip> AC <signed BE16>` shows up only while the system IMPORTS from the
+    # grid — early morning, battery empty, PV < house load. Its value ramps from
+    # a few kW toward zero as PV climbs, then the record vanishes entirely once
+    # grid ~0 (e.g. 5/20 09:47 grid 0.2 kW -> record absent). Seen as `00 ac`
+    # and, after earlier records collapse, `05 ac`. Read signed BE16 as watts,
+    # negative = importing. NOT yet confirmed and absent most of the day, so we
+    # publish only when it's cleanly present — letting it be validated live
+    # against the inverter's grid-power readout. Scale is tentative (the value's
+    # low byte is a structural 0x20 tag). See compaction vocabulary census.
+    for i in range(200, len(body) - 3):
+        if body[i + 1] != 0xAC or body[i] >= 0x10:
+            continue
+        gw = struct.unpack_from(">h", body, i + 2)[0]
+        if -8000 <= gw <= -50:               # plausible import, negative
+            result["grid_power"] = gw        # W, negative = import
+            break
 
     return result
 
