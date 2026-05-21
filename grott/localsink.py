@@ -456,31 +456,26 @@ def decode_telemetry(data: bytes) -> dict:
                 result["grid_voltage"] = round(vac / 10.0, 1)
                 break
 
-    # --- Battery voltage (anchored) ---
-    # Battery block: marker `00 07 b8`, then a counter byte, then a 3-value
-    # sandwich `02 XX  01 BATT  02 XX` (BATT = pack voltage /10 V). The matching
-    # flanks confirm alignment; require a sane 48V-bank range. Reliable at night;
-    # daytime alignment occasionally drifts (then guards skip rather than emit).
-    anc = body.find(b"\x00\x07\xb8")
-    if anc >= 0 and anc + 10 <= len(body):
-        if (body[anc + 4] == 0x02 and body[anc + 6] == 0x01
-                and struct.unpack_from(">H", body, anc + 4)[0]
-                == struct.unpack_from(">H", body, anc + 8)[0]):
-            f1 = struct.unpack_from(">H", body, anc + 4)[0]
-            batt_raw = struct.unpack_from(">H", body, anc + 6)[0]
-            batt = batt_raw / 10.0
-            # Daytime alignment drifts and yields coincidental sandwich matches.
-            # At a genuine battery block the upper flank F1 sits ~10 V above the
-            # pack voltage (raw diff ~96-108, verified across the night); require
-            # that to reject daytime garbage. Net effect: battery_voltage is
-            # published only when trustworthy (reliably overnight).
-            # Range is the inverter's real operating window: LBCO 46.0 V (empty)
-            # to just above Float 52.0 V (full); allow a little headroom for
-            # absorption/equalization charge voltage.
-            if 45.5 <= batt <= 54.5 and 85 <= (f1 - batt_raw) <= 120:
-                result["battery_voltage"] = round(batt, 1)
-                # SOC is voltage-derived (no dedicated register on this inverter).
-                result["battery_soc"] = soc_from_voltage(batt)
+    # --- Battery voltage + SOC (sandwich pattern, anchor-byte-agnostic) ---
+    # The battery block is a sandwich `F1 | BATT | F1`: two EQUAL BE16 flanks 4
+    # bytes apart with the pack voltage (BATT, /10 V) between them. It used to be
+    # located via a `00 07 b8` prefix, but that 3rd byte drifts (b8/b9/…) and the
+    # hard search silently missed whole nights. Instead match the pattern itself:
+    # equal flanks, a plausible 45.5-54.5 V pack value (LBCO 46 → Float 52, plus
+    # absorption/equalization headroom), and the flank sitting ~9-12 V above the
+    # pack (raw diff 85-120 — the genuine block; rejects coincidental matches).
+    for i in range(0, len(body) - 5):
+        f1 = struct.unpack_from(">H", body, i)[0]
+        if f1 != struct.unpack_from(">H", body, i + 4)[0]:
+            continue
+        batt_raw = struct.unpack_from(">H", body, i + 2)[0]
+        if not (455 <= batt_raw <= 545 and 85 <= (f1 - batt_raw) <= 120):
+            continue
+        batt = batt_raw / 10.0
+        result["battery_voltage"] = round(batt, 1)
+        # SOC is voltage-derived (no dedicated register on this inverter).
+        result["battery_soc"] = soc_from_voltage(batt)
+        break
 
     return result
 
