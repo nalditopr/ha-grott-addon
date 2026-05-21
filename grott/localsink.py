@@ -369,19 +369,18 @@ def extract_metadata(data: bytes) -> dict:
     return meta
 
 
-# LiFePO4 pack SOC vs voltage, anchored to THIS inverter's own battery settings
-# (from the Battery Settings screen): Float 52.0 V = full = 100%, empty = 0% at
-# 45.5 V — the pack's observed resting floor at dawn after a full discharge sits
-# at 45.5 V (just under the 46.0 V LBCO threshold), so that's the true 0% anchor.
+# LiFePO4 pack SOC vs RESTING voltage (48 V / 16S), from the owner's reference
+# chart. Uses the "rest" column (we read voltage mostly at night when the pack
+# is resting/discharging, not under charge): 0% = 40.0 V, 100% rest = 54.4 V.
+# Note the steep knees at the ends and the very flat plateau 30-90% (51.5-53.6 V)
+# characteristic of LiFePO4 — small voltage changes there mean large SOC swings.
 # The inverter has no separate SOC register — it derives state-of-charge from
-# pack voltage against these thresholds, which is why SOC never appeared in the
-# byte stream. Curve follows the LiFePO4 shape (gentle plateau through the
-# mid/upper band) rather than a straight line. Piecewise-linear; tune breakpoints
-# against the display if needed. Voltage under charge reads high (clamped to 100).
+# pack voltage, which is why SOC never appeared in the byte stream. Piecewise-
+# linear; voltage under charge reads high (e.g. 58.4 V at 100% charging) so it
+# clamps to 100. Tune breakpoints against the display if needed.
 LIFEPO4_SOC_CURVE = [
-    (45.5, 0), (47.0, 8), (47.5, 13), (48.0, 20), (48.5, 28),
-    (49.0, 37), (49.5, 47), (50.0, 57), (50.5, 68), (51.0, 79),
-    (51.5, 90), (52.0, 100),
+    (40.0, 0), (48.0, 10), (51.2, 20), (51.5, 30), (52.0, 40), (52.2, 50),
+    (52.3, 60), (52.8, 70), (53.1, 80), (53.6, 90), (54.4, 100),
 ]
 
 
