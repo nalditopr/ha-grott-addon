@@ -224,6 +224,12 @@ def ha_publish_discovery(meta: dict, cid: int) -> None:
     if client is None:
         return
     serial = meta.get("serial") or "unknown"
+    if serial == "unknown":
+        # Don't create a phantom 'grott_unknown' device. This happens when a
+        # frame arrives without a decodable serial (e.g. during a failed cloud
+        # redirect where the dongle is rejected before sending telemetry). Wait
+        # for a real serial — don't set the sent flag, so a later frame retries.
+        return
     device_id = f"grott_{serial}"
     device = {
         "identifiers": [device_id],
@@ -277,10 +283,23 @@ def ha_publish_discovery(meta: dict, cid: int) -> None:
         except Exception:
             pass
 
+    # One-time cleanup of the phantom 'grott_unknown' device that older builds
+    # created when no serial was decoded yet. Clear all its retained discovery
+    # configs so HA drops the duplicate device (uses the addon's own MQTT conn).
+    phantom = 0
+    if device_id != "grott_unknown":
+        all_keys = [s["key"] for s in HA_SENSORS + HA_TELEMETRY_SENSORS] + STALE_DISCOVERY_KEYS
+        for key in all_keys:
+            try:
+                client.publish(f"homeassistant/sensor/grott_unknown/{key}/config", "", retain=True)
+                phantom += 1
+            except Exception:
+                pass
+
     if sent:
         _ha_discovery_sent = True
         _log(cid, f"HA discovery published — {sent} sensors as {device_id}"
-                  f" ({purged} stale topics purged)")
+                  f" ({purged} stale topics purged, {phantom} phantom grott_unknown cleared)")
 
 
 def extract_metadata(data: bytes) -> dict:
