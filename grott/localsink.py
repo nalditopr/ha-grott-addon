@@ -400,9 +400,20 @@ def extract_metadata(data: bytes) -> dict:
 # SOC never appeared in the byte stream. Piecewise-linear; voltage under charge
 # reads high (up to 58.4 V at 100% charging) so it clamps to 100.
 LIFEPO4_SOC_CURVE = [
-    (45.0, 0), (48.0, 10), (51.2, 20), (51.5, 30), (52.0, 40), (52.2, 50),
+    # 0% re-anchored to the pack's REAL deep floor (~43.0 V). Multi-night data
+    # shows it discharges to ~43.6 V and keeps running the house (off-grid) — so
+    # 45.0 V was clamping the real 43.5-45 V working range to 0%. 43.0 V (≈2.69
+    # V/cell, the LiFePO4 knee) is true empty; normal nightly lows now read a few %.
+    (43.0, 0), (48.0, 10), (51.2, 20), (51.5, 30), (52.0, 40), (52.2, 50),
     (52.3, 60), (52.8, 70), (53.1, 80), (53.6, 90), (54.4, 100),
 ]
+
+# Pack internal resistance (ohms) for load-sag compensation of SOC. Under load
+# the terminal voltage sags below the resting value (and rises under charge), so
+# raw voltage→SOC swings between charge/discharge. We estimate the resting voltage
+# as terminal + I*R (I = battery current, + when discharging) before mapping.
+# ~0.04 Ω matches the observed ~1 V sag at the ~1.3 kW (~30 A) night load. Tunable.
+BATTERY_INTERNAL_OHM = 0.04
 
 
 def soc_from_voltage(v: float) -> int:
@@ -527,9 +538,8 @@ def decode_telemetry(data: bytes) -> dict:
             continue
         batt = batt_raw / 10.0
         result["battery_voltage"] = round(batt, 1)
-        # SOC is voltage-derived (no dedicated register on this inverter). NOTE:
-        # the curve is a RESTING curve, so SOC reads a bit high during active
-        # charge (pack voltage is elevated above its rest value while charging).
+        # Provisional SOC from raw terminal voltage; recomputed with load
+        # compensation at the end (once charge/discharge power is known).
         result["battery_soc"] = soc_from_voltage(batt)
         # The matching flanks are the DC Bus voltage (GroBro: SPF reg19, /10 V).
         result["bus_voltage"] = round(f1 / 10.0, 1)
@@ -564,6 +574,22 @@ def decode_telemetry(data: bytes) -> dict:
         net = result["pv_power"] - result["ac_output"]   # + = into battery
         result["battery_charge_power"] = round(max(0, net))
         result["battery_discharge_power"] = round(max(0, -net))
+
+    # --- Load-compensated SOC -----------------------------------------------
+    # Raw terminal voltage sags under discharge and rises under charge, making
+    # voltage→SOC swing (e.g. 100% mid-charge vs 0% at night). Estimate the
+    # RESTING voltage = terminal + I*R (I = pack current, + discharging /
+    # - charging) and map THAT to the curve, so charge/discharge readings
+    # converge to the same resting SOC. R = BATTERY_INTERNAL_OHM (tunable).
+    if "battery_voltage" in result:
+        vt = result["battery_voltage"]
+        amps = 0.0
+        if result.get("battery_discharge_power"):
+            amps = result["battery_discharge_power"] / vt          # + sag -> add
+        elif result.get("battery_charge_power"):
+            amps = -result["battery_charge_power"] / vt            # - bump -> subtract
+        rest_v = vt + amps * BATTERY_INTERNAL_OHM
+        result["battery_soc"] = soc_from_voltage(rest_v)
 
     return result
 
