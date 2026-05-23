@@ -112,8 +112,15 @@ HA_TELEMETRY_SENSORS = [
      "device_class": "voltage", "state_class": "measurement"},
     {"key": "battery_voltage", "name": "Battery Voltage", "unit": "V", "topic": "telemetry",
      "device_class": "voltage", "state_class": "measurement"},
+    # Primary SOC: coulomb-counted (charge/discharge integrated over ~19.6 kWh
+    # usable, re-anchored to 100% at full voltage, slow-synced to the voltage
+    # curve). Smooth + accurate; immune to the voltage/load-sag jumpiness.
     {"key": "battery_soc", "name": "Battery SOC", "unit": "%", "topic": "telemetry",
      "device_class": "battery", "state_class": "measurement"},
+    # Diagnostic: the raw load-compensated voltage SOC (what coulomb syncs to).
+    {"key": "battery_soc_voltage", "name": "Battery SOC (voltage)", "unit": "%",
+     "topic": "telemetry", "device_class": "battery", "state_class": "measurement",
+     "entity_category": "diagnostic"},
     {"key": "bus_voltage", "name": "Bus Voltage", "unit": "V", "topic": "telemetry",
      "device_class": "voltage", "state_class": "measurement"},
     # NOTE: a "grid power" sensor used to live here (the 00ac record). REMOVED in
@@ -266,6 +273,8 @@ def ha_publish_discovery(meta: dict, cid: int) -> None:
             cfg["state_class"] = s["state_class"]
         if "icon" in s:
             cfg["icon"] = s["icon"]
+        if "entity_category" in s:
+            cfg["entity_category"] = s["entity_category"]
         topic = f"homeassistant/sensor/{device_id}/{key}/config"
         try:
             # Discovery configs MUST be retained so HA picks them up on restart
@@ -429,6 +438,58 @@ def soc_from_voltage(v: float) -> int:
     return pts[-1][1]
 
 
+# --- Coulomb-counting SOC ---------------------------------------------------
+# Voltage SOC is noisy (flat LiFePO4 curve + load sag). Coulomb counting tracks
+# charge in/out instead, which is smooth and accurate. We derived the usable
+# capacity from a full recharge: 3% -> 100% took 19.0 kWh => ~19.6 kWh usable.
+# State (last SOC + timestamp) persists in /data so it survives addon restarts.
+#   - integrate net battery energy (charge - discharge) / capacity each frame
+#   - HARD anchor: when pack voltage reaches "full" (~54.2 V), reset to 100%
+#   - SLOW re-sync toward the (load-compensated) voltage SOC to bound drift
+BATTERY_USABLE_KWH = 19.6        # measured; tune if a fuller cycle says otherwise
+SOC_STATE_FILE = "/data/soc_state.json"
+SOC_FULL_RESET_V = 54.2          # pack V at/above which we re-anchor to 100%
+SOC_RESYNC_RATE = 0.005          # gentle blend toward voltage SOC (~11 h const); the
+                                 # daily full-voltage anchor does the real re-cal, so
+                                 # this just bounds drift on multi-cloudy-day stretches
+
+
+def _load_soc_state() -> dict | None:
+    try:
+        with open(SOC_STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_soc_state(soc: float, ts: float) -> None:
+    try:
+        with open(SOC_STATE_FILE, "w") as f:
+            json.dump({"soc": soc, "ts": ts}, f)
+    except Exception:
+        pass
+
+
+def coulomb_soc(vbat: float, charge_w: float, discharge_w: float, voltage_soc: float) -> int:
+    """Stateful coulomb-counted SOC %. charge_w/discharge_w in W (>=0)."""
+    now = time.time()
+    st = _load_soc_state()
+    if st is None:
+        soc = float(voltage_soc)                       # cold start: seed from voltage
+    else:
+        soc = float(st.get("soc", voltage_soc))
+        dt_h = (now - st.get("ts", now)) / 3600.0
+        if 0 < dt_h <= 0.5:                            # integrate over a sane interval only
+            net_w = charge_w - discharge_w            # + into battery
+            soc += (net_w * dt_h / 1000.0) / BATTERY_USABLE_KWH * 100.0
+    if vbat >= SOC_FULL_RESET_V:                       # hard re-anchor at full
+        soc = 100.0
+    soc += (voltage_soc - soc) * SOC_RESYNC_RATE       # slow drift correction
+    soc = max(0.0, min(100.0, soc))
+    _save_soc_state(soc, now)
+    return round(soc)
+
+
 def decode_telemetry(data: bytes) -> dict:
     """Decode live PV telemetry from the 2nd (live) 0x260f message.
 
@@ -589,7 +650,15 @@ def decode_telemetry(data: bytes) -> dict:
         elif result.get("battery_charge_power"):
             amps = -result["battery_charge_power"] / vt            # - bump -> subtract
         rest_v = vt + amps * BATTERY_INTERNAL_OHM
-        result["battery_soc"] = soc_from_voltage(rest_v)
+        v_soc = soc_from_voltage(rest_v)
+        # voltage SOC kept as a diagnostic; primary battery_soc is coulomb-counted
+        result["battery_soc_voltage"] = v_soc
+        result["battery_soc"] = coulomb_soc(
+            vt,
+            result.get("battery_charge_power", 0) or 0,
+            result.get("battery_discharge_power", 0) or 0,
+            v_soc,
+        )
 
     return result
 
