@@ -1,0 +1,681 @@
+# =============================================================================
+#  Growatt SPH 10000TL-HU-US ⇄ Home Assistant via direct RS485 Modbus RTU
+#  Board : Waveshare ESP32-S3-RS485-CAN (RS485 TX=GPIO17 RX=GPIO18 DE/EN=GPIO21)
+#  Link  : RS485 on the inverter's CN5 "Upper Computer" port (NOT the BMS port)
+#          RJ45 T568B: pin1=B- (orange/white), pin2=A+ (orange), pin5=GND (blue/white)
+#          115200 8N1, Modbus slave address 1
+#  Extras: Home Assistant Bluetooth proxy (active)
+#
+#  Register map = Growatt grid-tie "Protocol II" (SPH TL-HU-US), input regs (FC04).
+#  Source: github.com/akomakom/esphome-growatt-modbus (SPH10000TL-HU-US-tested).
+# =============================================================================
+
+substitutions:
+  name: growatt-sph
+  friendly_name: Growatt SPH
+  modbus_address: "0x01"
+  poll_interval: "10s"
+  battery_capacity_wh: "20000"   # 2x10kWh nameplate (Meritsun + mini powerwall, confirmed 2026-06-10); matches measured ~20kWh charge
+  soc_full_reset_v: "52.0"       # re-anchor SOC to 100% only on true-full days (pack reaches ~52.4V when fully charged)
+  charge_efficiency: "0.97"      # coulombic loss factor applied while charging
+  pv_zero_threshold: "50"        # W; clamp PV power below this to 0 (kills ~36W night phantom)
+  power_max_w: "50000"           # W; reject power readings beyond this (0xFFFFFFFF sentinel spikes)
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap: {}
+
+captive_portal:
+
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 1100ms
+    window: 1100ms
+    active: true
+bluetooth_proxy:
+  active: true
+
+uart:
+  id: mod_uart
+  tx_pin: GPIO17
+  rx_pin: GPIO18
+  baud_rate: 115200        # SPH grid-tie runs 115200, NOT 9600
+  stop_bits: 1
+  data_bits: 8
+  parity: NONE
+
+modbus:
+  id: modbus1
+  uart_id: mod_uart
+  flow_control_pin: GPIO21
+
+modbus_controller:
+  - id: sph
+    address: ${modbus_address}
+    modbus_id: modbus1
+    update_interval: ${poll_interval}
+    setup_priority: -10
+
+# persist coulomb SOC across reboots (batched flash writes to limit wear)
+preferences:
+  flash_write_interval: 120s
+
+globals:
+  - id: soc_pct
+    type: float
+    restore_value: true
+    initial_value: '-1'          # -1 = unseeded; first run seeds from voltage SOC
+
+# coulomb counter: integrate net battery power every 10s into soc_pct
+interval:
+  - interval: 10s
+    then:
+      - lambda: |-
+          float v = id(bat_v).state;
+          if (isnan(v) || v < 1.0) return;
+          float chg = isnan(id(bat_chg).state) ? 0.0 : id(bat_chg).state;
+          float dis = isnan(id(bat_dis).state) ? 0.0 : id(bat_dis).state;
+          if (id(soc_pct) < 0.0) {                      // first boot: seed from voltage
+            if (id(bat_soc_v).has_state() && !isnan(id(bat_soc_v).state))
+              id(soc_pct) = id(bat_soc_v).state;
+            return;
+          }
+          float net_w = chg - dis;                      // + charging / - discharging
+          float eff = net_w > 0.0 ? ${charge_efficiency} : 1.0;
+          float dt_h = 10.0 / 3600.0;
+          id(soc_pct) += net_w * eff * dt_h / ${battery_capacity_wh} * 100.0;
+          if (v >= ${soc_full_reset_v}) id(soc_pct) = 100.0;   // full-charge anchor
+          if (id(soc_pct) > 100.0) id(soc_pct) = 100.0;
+          if (id(soc_pct) < 0.0)   id(soc_pct) = 0.0;
+
+sensor:
+  # ---- PV ----
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    id: pv_input_power
+    name: "PV Input Power"
+    register_type: read
+    address: 1
+    value_type: U_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w}) return {};
+          if (x < ${pv_zero_threshold}) return 0.0;
+          return x;
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "PV1 Voltage"
+    register_type: read
+    address: 3
+    value_type: U_WORD
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "PV1 Current"
+    register_type: read
+    address: 4
+    value_type: U_WORD
+    unit_of_measurement: A
+    device_class: current
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "PV1 Power"
+    register_type: read
+    address: 5
+    value_type: U_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w}) return {};
+          if (x < ${pv_zero_threshold}) return 0.0;
+          return x;
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "PV2 Voltage"
+    register_type: read
+    address: 7
+    value_type: U_WORD
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "PV2 Current"
+    register_type: read
+    address: 8
+    value_type: U_WORD
+    unit_of_measurement: A
+    device_class: current
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "PV2 Power"
+    register_type: read
+    address: 9
+    value_type: U_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w}) return {};
+          if (x < ${pv_zero_threshold}) return 0.0;
+          return x;
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "PV3 Voltage"
+    register_type: read
+    address: 11
+    value_type: U_WORD
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "PV3 Current"
+    register_type: read
+    address: 12
+    value_type: U_WORD
+    unit_of_measurement: A
+    device_class: current
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "PV3 Power"
+    register_type: read
+    address: 13
+    value_type: U_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w}) return {};
+          if (x < ${pv_zero_threshold}) return 0.0;
+          return x;
+
+  # ---- AC output / grid ----
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    id: ac_output_power
+    name: "AC Output Power"
+    register_type: read
+    address: 35
+    value_type: U_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w}) return {};
+          return x;
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Grid Frequency"
+    register_type: read
+    address: 37
+    value_type: U_WORD
+    unit_of_measurement: Hz
+    device_class: frequency
+    accuracy_decimals: 2
+    filters: [{ multiply: 0.01 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Grid Voltage L1"
+    register_type: read
+    address: 38
+    value_type: U_WORD
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Grid Voltage L2"
+    register_type: read
+    address: 42
+    value_type: U_WORD
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Grid Import Power L1"
+    register_type: read
+    address: 1015
+    value_type: S_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w} || x < -${power_max_w}) return {};
+          return x;
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Grid Export Power L1"
+    register_type: read
+    address: 1023
+    value_type: S_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w} || x < -${power_max_w}) return {};
+          return x;
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Grid to Load Power"
+    register_type: read
+    address: 116
+    value_type: U_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w}) return {};
+          return x;
+
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Grid Current L1"
+    register_type: read
+    address: 39
+    value_type: U_WORD
+    unit_of_measurement: A
+    device_class: current
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Grid Current L2"
+    register_type: read
+    address: 43
+    value_type: U_WORD
+    unit_of_measurement: A
+    device_class: current
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Grid Import Power L2"
+    register_type: read
+    address: 1017
+    value_type: S_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w} || x < -${power_max_w}) return {};
+          return x;
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Grid Export Power L2"
+    register_type: read
+    address: 1025
+    value_type: S_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w} || x < -${power_max_w}) return {};
+          return x;
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    id: grid_import_power
+    name: "Grid Import Power"
+    register_type: read
+    address: 1021
+    value_type: S_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w} || x < -${power_max_w}) return {};
+          return x;
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    id: grid_export_power
+    name: "Grid Export Power"
+    register_type: read
+    address: 1029
+    value_type: S_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w} || x < -${power_max_w}) return {};
+          return x;
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "IPM Temperature"
+    register_type: read
+    address: 94
+    value_type: S_WORD
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Boost Temperature"
+    register_type: read
+    address: 95
+    value_type: S_WORD
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+
+  # ---- Battery ----
+  # NOTE: this inverter is NOT in closed-loop comms with the battery BMS, so the
+  # BMS-sourced registers (SOC=1014/1086, current=1088) all return 0. Voltage and
+  # charge/discharge power ARE measured by the inverter, so we derive SOC+current.
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    id: bat_v
+    name: "Battery Voltage"
+    register_type: read
+    address: 1013
+    value_type: U_WORD
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    id: bat_dis
+    name: "Battery Discharge Power"
+    register_type: read
+    address: 1009
+    value_type: U_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w}) return {};
+          return x;
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    id: bat_chg
+    name: "Battery Charge Power"
+    register_type: read
+    address: 1011
+    value_type: U_DWORD
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+      - lambda: |-
+          if (x > ${power_max_w}) return {};
+          return x;
+  # derived: battery current (positive = charging, negative = discharging)
+  - platform: template
+    name: "Battery Current"
+    unit_of_measurement: A
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      float v = id(bat_v).state;
+      if (isnan(v) || v < 1.0) return 0.0;
+      float chg = isnan(id(bat_chg).state) ? 0.0 : id(bat_chg).state;
+      float dis = isnan(id(bat_dis).state) ? 0.0 : id(bat_dis).state;
+      return (chg - dis) / v;
+  # signed battery power (+ charging / - discharging) for Helios battery-power-entity
+  # NOTE: named "Battery Net Power" (not "Battery Power") to avoid the stale unique_id
+  # collision with the old growatt-spf reg-77 sensor → clean sensor.growatt_sph_battery_net_power
+  - platform: template
+    name: "Battery Net Power"
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      float chg = isnan(id(bat_chg).state) ? 0.0 : id(bat_chg).state;
+      float dis = isnan(id(bat_dis).state) ? 0.0 : id(bat_dis).state;
+      return chg - dis;
+  # diagnostic: load-compensated voltage-curve SOC (seeds coulomb counter + sanity check)
+  - platform: template
+    id: bat_soc_v
+    name: "Battery SOC (voltage)"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      float v = id(bat_v).state;
+      if (isnan(v) || v < 1.0) return {};
+      float chg = isnan(id(bat_chg).state) ? 0.0 : id(bat_chg).state;
+      float dis = isnan(id(bat_dis).state) ? 0.0 : id(bat_dis).state;
+      float i = (chg - dis) / v;            // + charge / - discharge
+      float rest = v - i * 0.04;            // remove I*R (R~0.04ohm) -> resting V
+      const float vs[11] = {43.0,48.0,51.2,51.5,52.0,52.2,52.3,52.8,53.1,53.6,54.4};
+      const float ss[11] = {0,10,20,30,40,50,60,70,80,90,100};
+      if (rest <= vs[0]) return 0.0;
+      if (rest >= vs[10]) return 100.0;
+      for (int k = 0; k < 10; k++)
+        if (rest >= vs[k] && rest <= vs[k+1])
+          return ss[k] + (ss[k+1]-ss[k]) * (rest-vs[k]) / (vs[k+1]-vs[k]);
+      return {};
+  # primary: coulomb-counted SOC (charge always raises it, discharge lowers it)
+  - platform: template
+    id: bat_soc
+    name: "Battery SOC"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: 'return id(soc_pct) < 0.0 ? NAN : id(soc_pct);'
+
+  # ---- Temperatures ----
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Inverter Temperature"
+    register_type: read
+    address: 93
+    value_type: S_WORD
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    filters: [{ multiply: 0.1 }]
+
+  # ---- Energy (for the HA Energy dashboard) ----
+  # phantom-free solar: integrate the dead-banded PV Input Power -> kWh (persists across reboots)
+  - platform: integration
+    name: "PV Energy (filtered)"
+    id: pv_energy_filtered
+    sensor: pv_input_power
+    time_unit: h
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    restore: true
+    filters:
+      - multiply: 0.001
+  # measured house consumption: integrate AC Output Power -> kWh (independent of HA's derived figure)
+  - platform: integration
+    name: "House Load Energy"
+    id: house_load_energy
+    sensor: ac_output_power
+    time_unit: h
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    restore: true
+    filters:
+      - multiply: 0.001
+  # inverter conversion loss = (DC sources + grid) - AC output; labels the Energy Dashboard "untracked"
+  - platform: template
+    name: "Inverter Loss Power"
+    id: inverter_loss_power
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      float pv = id(pv_input_power).state, ac = id(ac_output_power).state;
+      if (isnan(pv) || isnan(ac)) return 0.0;
+      float gi = isnan(id(grid_import_power).state)?0:id(grid_import_power).state;
+      float ge = isnan(id(grid_export_power).state)?0:id(grid_export_power).state;
+      float bd = isnan(id(bat_dis).state)?0:id(bat_dis).state;
+      float bc = isnan(id(bat_chg).state)?0:id(bat_chg).state;
+      float loss = (pv + gi - ge + bd - bc) - ac;   // DC-in minus AC-out = conversion loss
+      return loss > 0.0 ? loss : 0.0;
+  - platform: integration
+    name: "Inverter Loss Energy"
+    id: inverter_loss_energy
+    sensor: inverter_loss_power
+    time_unit: h
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    restore: true
+    filters:
+      - multiply: 0.001
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Today PV Production"
+    register_type: read
+    address: 1149
+    value_type: U_DWORD
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Total PV Production"
+    register_type: read
+    address: 91
+    value_type: U_DWORD
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Total Grid Import"
+    register_type: read
+    address: 1046
+    value_type: U_DWORD
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Total Grid Export"
+    register_type: read
+    address: 1050
+    value_type: U_DWORD
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Total Battery Charge"
+    register_type: read
+    address: 1058
+    value_type: U_DWORD
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    filters: [{ multiply: 0.1 }]
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Total Battery Discharge"
+    register_type: read
+    address: 1054
+    value_type: U_DWORD
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    filters: [{ multiply: 0.1 }]
+
+# ---- Inverter status code ----
+text_sensor:
+  - platform: modbus_controller
+    modbus_controller_id: sph
+    name: "Inverter Status"
+    register_type: read
+    address: 0
+    raw_encode: HEXBYTES
+    lambda: |-
+      switch (modbus_controller::word_from_hex_str(x, 0)) {
+        case 0:  return std::string("Standby");
+        case 1:  return std::string("Normal");
+        case 3:  return std::string("Fault");
+        case 4:  return std::string("Flash/Update");
+        case 5:  return std::string("PV+Battery Online");
+        case 6:  return std::string("Battery Online");
+        case 7:  return std::string("PV Charging");
+        case 8:  return std::string("Bypass");
+        default: return std::string("Unknown");
+      }
